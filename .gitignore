@@ -1,0 +1,26 @@
+# dependencies
+/node_modules
+
+# next.js
+/.next
+/out
+/src-tauri/gen
+/src-tauri/target
+
+# local environment files
+.env*
+!.env.example
+
+# logs and reports
+*.log
+/coverage
+
+# macOS
+.DS_Store
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# Vercel
+.vercel
