@@ -16,6 +16,19 @@ export type QueryResult = {
   rowCount: number
   truncated: boolean
   sql: string
+  tokenUsage: {
+    inputTokens: number
+    outputTokens: number
+    cachedInputTokens: number
+    totalTokens: number
+  }
+  schemaSelection: {
+    totalTables: number
+    totalColumns: number
+    selectedTables: number
+    selectedColumns: number
+    contextCharacters: number
+  }
 }
 
 export type SchemaColumn = {

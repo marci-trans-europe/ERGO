@@ -268,11 +268,26 @@ export const QueryResultCard = ({ result }: QueryResultCardProps) => {
       )}
 
       <footer>
-        {result.truncated ? (
-          <span>A lista a beállított sorkorlátig látható.</span>
-        ) : (
-          <span>Teljes lekérdezési eredmény</span>
-        )}
+        <div className="result-meta">
+          {result.truncated ? (
+            <span>A lista a beállított sorkorlátig látható.</span>
+          ) : (
+            <span>Teljes lekérdezési eredmény</span>
+          )}
+          <span>
+            Séma: {result.schemaSelection.selectedTables}/
+            {result.schemaSelection.totalTables} tábla ·{' '}
+            {result.schemaSelection.selectedColumns}/
+            {result.schemaSelection.totalColumns} oszlop
+          </span>
+          <span>
+            Token: {result.tokenUsage.inputTokens} be ·{' '}
+            {result.tokenUsage.outputTokens} ki
+            {result.tokenUsage.cachedInputTokens > 0
+              ? ` · ${result.tokenUsage.cachedInputTokens} cache`
+              : ''}
+          </span>
+        </div>
         <details>
           <summary>
             <Braces aria-hidden="true" size={14} /> SQL megtekintése

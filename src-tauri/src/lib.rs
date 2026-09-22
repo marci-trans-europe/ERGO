@@ -1,4 +1,10 @@
-use std::{fs, path::PathBuf, time::Duration};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, HashSet},
+    fs,
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use keyring::Entry;
 use mysql_async::{prelude::Queryable, OptsBuilder, Pool, Row, SslOpts, Value};
@@ -12,8 +18,12 @@ use tokio::time::timeout;
 const KEYCHAIN_SERVICE: &str = "hu.transeurope.ergo";
 const MYSQL_PASSWORD_ACCOUNT: &str = "mysql-password";
 const AI_API_KEY_ACCOUNT: &str = "ai-api-key";
-const MAX_SCHEMA_COLUMNS: usize = 1_500;
 const MAX_RESULT_ROWS: usize = 200;
+const MAX_SCHEMA_TABLES_PER_QUESTION: usize = 8;
+const MAX_SCHEMA_COLUMNS_PER_TABLE: usize = 36;
+const SCHEMA_CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const SUMMARY_PREVIEW_ROWS: usize = 40;
+const SUMMARY_PREVIEW_CHARACTERS: usize = 18_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,12 +105,84 @@ struct QueryResult {
     row_count: usize,
     truncated: bool,
     sql: String,
+    token_usage: TokenUsage,
+    schema_selection: SchemaSelectionStats,
 }
 
 #[derive(Debug, Serialize)]
 struct AnalyzeResponse {
     summary: String,
     result: QueryResult,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    total_tokens: u64,
+}
+
+impl TokenUsage {
+    fn add(&mut self, other: &Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.total_tokens += other.total_tokens;
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SchemaSelectionStats {
+    total_tables: usize,
+    total_columns: usize,
+    selected_tables: usize,
+    selected_columns: usize,
+    context_characters: usize,
+}
+
+#[derive(Clone, Debug)]
+struct AiCallResult {
+    content: String,
+    usage: TokenUsage,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SchemaCatalog {
+    database: String,
+    source: String,
+    generated_at: u64,
+    tables: Vec<SchemaTable>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SchemaTable {
+    name: String,
+    table_type: String,
+    estimated_rows: Option<u64>,
+    columns: Vec<CatalogColumn>,
+    relationships: Vec<CatalogRelationship>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogColumn {
+    name: String,
+    column_type: String,
+    nullable: bool,
+    key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogRelationship {
+    column: String,
+    referenced_table: String,
+    referenced_column: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +200,13 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_config_dir()
         .map(|directory| directory.join("settings.json"))
         .map_err(|error| format!("A helyi konfiguráció útvonala nem érhető el: {error}"))
+}
+
+fn schema_cache_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("schema-catalog.json"))
+        .map_err(|error| format!("A helyi sémagyorsítótár útvonala nem érhető el: {error}"))
 }
 
 fn read_settings(app: &AppHandle) -> Result<StoredSettings, String> {
@@ -407,10 +496,10 @@ async fn check_database(app: AppHandle) -> Result<(), String> {
     test_database(&settings, password).await
 }
 
-async fn inspect_schema(
+async fn inspect_schema_catalog(
     settings: &StoredSettings,
     password: String,
-) -> Result<Vec<JsonValue>, String> {
+) -> Result<SchemaCatalog, String> {
     let pool = database_pool(settings, password);
     let mut connection = timeout(Duration::from_secs(12), pool.get_conn())
         .await
@@ -421,34 +510,430 @@ async fn inspect_schema(
         .await
         .map_err(|error| format!("A csak olvasható munkamenet nem indítható: {error}"))?;
 
-    let sql = format!(
-        "SELECT c.TABLE_NAME, t.TABLE_TYPE, c.COLUMN_NAME, c.COLUMN_TYPE, c.IS_NULLABLE \
-         FROM information_schema.COLUMNS c \
-         INNER JOIN information_schema.TABLES t \
-           ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME \
-         WHERE c.TABLE_SCHEMA = ? \
-         ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION LIMIT {}",
-        MAX_SCHEMA_COLUMNS
-    );
-    let rows: Vec<Row> = connection
-        .exec(sql, (settings.mysql_database.clone(),))
+    let table_rows: Vec<Row> = connection
+        .exec(
+            "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS \
+             FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
+            (settings.mysql_database.clone(),),
+        )
         .await
-        .map_err(|error| format!("Az adatbázis-séma nem olvasható: {error}"))?;
+        .map_err(|error| format!("A tábla-metaadatok nem olvashatók: {error}"))?;
+    let column_rows: Vec<Row> = connection
+        .exec(
+            "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY \
+             FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, ORDINAL_POSITION",
+            (settings.mysql_database.clone(),),
+        )
+        .await
+        .map_err(|error| format!("Az oszlop-metaadatok nem olvashatók: {error}"))?;
+    let relationship_rows: Vec<Row> = connection
+        .exec(
+            "SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
+             FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL \
+             ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION",
+            (settings.mysql_database.clone(),),
+        )
+        .await
+        .map_err(|error| format!("A kapcsolati metaadatok nem olvashatók: {error}"))?;
     drop(connection);
     pool.disconnect().await.ok();
 
-    Ok(rows
+    let mut tables = table_rows
         .into_iter()
         .map(|row| {
-            json!({
-                "table": row.get::<String, _>("TABLE_NAME").unwrap_or_default(),
-                "tableType": row.get::<String, _>("TABLE_TYPE").unwrap_or_default(),
-                "column": row.get::<String, _>("COLUMN_NAME").unwrap_or_default(),
-                "dataType": row.get::<String, _>("COLUMN_TYPE").unwrap_or_default(),
-                "nullable": row.get::<String, _>("IS_NULLABLE").unwrap_or_default() == "YES"
-            })
+            let name = row.get::<String, _>("TABLE_NAME").unwrap_or_default();
+            (
+                name.clone(),
+                SchemaTable {
+                    name,
+                    table_type: row.get::<String, _>("TABLE_TYPE").unwrap_or_default(),
+                    estimated_rows: row.get::<Option<u64>, _>("TABLE_ROWS").flatten(),
+                    columns: Vec::new(),
+                    relationships: Vec::new(),
+                },
+            )
         })
-        .collect())
+        .collect::<BTreeMap<_, _>>();
+
+    for row in column_rows {
+        let table_name = row.get::<String, _>("TABLE_NAME").unwrap_or_default();
+        if let Some(table) = tables.get_mut(&table_name) {
+            table.columns.push(CatalogColumn {
+                name: row.get::<String, _>("COLUMN_NAME").unwrap_or_default(),
+                column_type: row.get::<String, _>("COLUMN_TYPE").unwrap_or_default(),
+                nullable: row.get::<String, _>("IS_NULLABLE").unwrap_or_default() == "YES",
+                key: row.get::<String, _>("COLUMN_KEY").unwrap_or_default(),
+            });
+        }
+    }
+
+    for row in relationship_rows {
+        let table_name = row.get::<String, _>("TABLE_NAME").unwrap_or_default();
+        if let Some(table) = tables.get_mut(&table_name) {
+            table.relationships.push(CatalogRelationship {
+                column: row.get::<String, _>("COLUMN_NAME").unwrap_or_default(),
+                referenced_table: row
+                    .get::<String, _>("REFERENCED_TABLE_NAME")
+                    .unwrap_or_default(),
+                referenced_column: row
+                    .get::<String, _>("REFERENCED_COLUMN_NAME")
+                    .unwrap_or_default(),
+            });
+        }
+    }
+
+    Ok(SchemaCatalog {
+        database: settings.mysql_database.clone(),
+        source: format!(
+            "{}:{}/{}",
+            settings.mysql_host, settings.mysql_port, settings.mysql_database
+        ),
+        generated_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        tables: tables.into_values().collect(),
+    })
+}
+
+async fn load_schema_catalog(
+    app: &AppHandle,
+    settings: &StoredSettings,
+    password: String,
+) -> Result<SchemaCatalog, String> {
+    let path = schema_cache_path(app)?;
+    let expected_source = format!(
+        "{}:{}/{}",
+        settings.mysql_host, settings.mysql_port, settings.mysql_database
+    );
+    if let Ok(contents) = fs::read_to_string(&path) {
+        if let Ok(catalog) = serde_json::from_str::<SchemaCatalog>(&contents) {
+            let age = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(catalog.generated_at);
+            if catalog.source == expected_source && age <= SCHEMA_CACHE_MAX_AGE.as_secs() {
+                return Ok(catalog);
+            }
+        }
+    }
+
+    let catalog = inspect_schema_catalog(settings, password).await?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "Érvénytelen sémagyorsítótár-útvonal.".to_string())?;
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("A sémagyorsítótár mappája nem hozható létre: {error}"))?;
+    let contents = serde_json::to_vec(&catalog)
+        .map_err(|error| format!("A sémagyorsítótár nem alakítható át: {error}"))?;
+    fs::write(path, contents)
+        .map_err(|error| format!("A sémagyorsítótár nem menthető: {error}"))?;
+    Ok(catalog)
+}
+
+fn normalize_for_search(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .map(|character| match character {
+            'á' => 'a',
+            'é' => 'e',
+            'í' => 'i',
+            'ó' | 'ö' | 'ő' => 'o',
+            'ú' | 'ü' | 'ű' => 'u',
+            other if other.is_ascii_alphanumeric() => other,
+            _ => ' ',
+        })
+        .collect()
+}
+
+fn schema_search_terms(question: &str, history: &[HistoryMessage]) -> HashSet<String> {
+    let stop_words = [
+        "adat", "adatok", "alapjan", "az", "egy", "es", "hogy", "kerlek", "legyen", "meg", "mely",
+        "melyik", "mi", "mind", "mutasd", "osszes", "szerint", "van", "volt",
+    ];
+    let mut search_text = history
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user")
+        .take(2)
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>();
+    search_text.push(question);
+    let normalized = normalize_for_search(&search_text.join(" "));
+    let mut terms = normalized
+        .split_whitespace()
+        .filter(|term| term.len() >= 3 && !stop_words.contains(term))
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+
+    let domain_terms: &[(&[&str], &[&str])] = &[
+        (
+            &["arbevetel", "bevetel", "forgalom", "sales"],
+            &["invoice", "invoiceline", "revenue", "amount", "net", "vat"],
+        ),
+        (
+            &["ugyfel", "vevo", "customer"],
+            &[
+                "customer",
+                "companycustomer",
+                "endcustomer",
+                "customernumber",
+                "name",
+            ],
+        ),
+        (
+            &["kintlevoseg", "tartozas", "lejart", "koveteles"],
+            &[
+                "customerentry",
+                "customerbalance",
+                "remainder",
+                "duedate",
+                "openclosed",
+            ],
+        ),
+        (
+            &["szamla", "invoice"],
+            &["invoice", "invoiceline", "invoicenumber", "invoicedate"],
+        ),
+        (
+            &["fuvar", "szallitas", "megbizas", "transport"],
+            &[
+                "jobheader",
+                "jobtrafficinformation",
+                "orderheader",
+                "deliverynote",
+                "freight",
+            ],
+        ),
+        (
+            &["rendeles", "order"],
+            &["orderheader", "orderline", "ordernumber"],
+        ),
+        (
+            &["beszallito", "vendor"],
+            &[
+                "vendor",
+                "companyvendor",
+                "vendorentry",
+                "vendorinvoicejournal",
+            ],
+        ),
+        (
+            &["fizetes", "payment"],
+            &[
+                "customerpayment",
+                "vendorpayment",
+                "payment",
+                "amount",
+                "entrydate",
+            ],
+        ),
+        (
+            &["koltseg", "eredmeny", "profit", "fokonyv"],
+            &[
+                "financeentry",
+                "account",
+                "debit",
+                "credit",
+                "amount",
+                "jobbalance",
+            ],
+        ),
+        (
+            &["dolgozo", "munkatars", "employee"],
+            &["employee", "employeerevision", "employeenumber", "name"],
+        ),
+        (
+            &["raktar", "keszlet", "termek", "cikk"],
+            &["warehouse", "inventory", "item", "stock", "quantity"],
+        ),
+    ];
+    for (triggers, expansions) in domain_terms {
+        if triggers.iter().any(|trigger| normalized.contains(trigger)) {
+            terms.extend(expansions.iter().map(|term| (*term).to_string()));
+        }
+    }
+    terms
+}
+
+fn select_schema_context(
+    catalog: &SchemaCatalog,
+    question: &str,
+    history: &[HistoryMessage],
+) -> (String, SchemaSelectionStats) {
+    let terms = schema_search_terms(question, history);
+    let mut scored_tables = catalog
+        .tables
+        .iter()
+        .map(|table| {
+            let name = table.name.to_lowercase();
+            let table_score = terms
+                .iter()
+                .filter(|term| name.contains(term.as_str()))
+                .count()
+                * 100;
+            let column_score = table
+                .columns
+                .iter()
+                .map(|column| {
+                    terms
+                        .iter()
+                        .filter(|term| column.name.contains(term.as_str()))
+                        .count()
+                })
+                .sum::<usize>()
+                * 8;
+            (table_score + column_score, table)
+        })
+        .collect::<Vec<_>>();
+    scored_tables.sort_by_key(|(score, table)| (Reverse(*score), table.name.clone()));
+
+    let mut selected = scored_tables
+        .iter()
+        .filter(|(score, _)| *score > 0)
+        .take(MAX_SCHEMA_TABLES_PER_QUESTION)
+        .map(|(_, table)| *table)
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        let fallbacks = [
+            "invoice",
+            "invoiceline",
+            "customer",
+            "customerentry",
+            "jobheader",
+            "orderheader",
+            "financeentry",
+        ];
+        selected = fallbacks
+            .iter()
+            .filter_map(|name| catalog.tables.iter().find(|table| table.name == *name))
+            .collect();
+    }
+
+    let analytical_fragments = [
+        "amount",
+        "balance",
+        "company",
+        "credit",
+        "currency",
+        "customer",
+        "date",
+        "debit",
+        "due",
+        "invoice",
+        "item",
+        "job",
+        "name",
+        "net",
+        "number",
+        "open",
+        "order",
+        "paid",
+        "payment",
+        "price",
+        "quantity",
+        "remainder",
+        "status",
+        "total",
+        "vat",
+        "vendor",
+    ];
+    let mut context = String::from(
+        "Csak az alábbi, kérdéshez helyben kiválasztott MySQL-séma használható. A dátum mezők formátumát ne feltételezd; szükség esetén szövegként kezeld.\n",
+    );
+    let mut selected_columns = 0;
+    for table in &selected {
+        let relationship_columns = table
+            .relationships
+            .iter()
+            .map(|relationship| relationship.column.as_str())
+            .collect::<HashSet<_>>();
+        let mut columns = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                let term_score = terms
+                    .iter()
+                    .filter(|term| column.name.contains(term.as_str()))
+                    .count()
+                    * 40;
+                let key_score = match column.key.as_str() {
+                    "PRI" => 80,
+                    "UNI" => 50,
+                    "MUL" => 12,
+                    _ => 0,
+                };
+                let relationship_score =
+                    usize::from(relationship_columns.contains(column.name.as_str())) * 60;
+                let analytical_score = analytical_fragments
+                    .iter()
+                    .filter(|fragment| column.name.contains(**fragment))
+                    .count()
+                    * 10;
+                let leading_score = usize::from(index < 4) * 4;
+                (
+                    term_score + key_score + relationship_score + analytical_score + leading_score,
+                    index,
+                    column,
+                )
+            })
+            .collect::<Vec<_>>();
+        columns.sort_by_key(|(score, index, _)| (Reverse(*score), *index));
+        columns.truncate(MAX_SCHEMA_COLUMNS_PER_TABLE);
+        columns.sort_by_key(|(_, index, _)| *index);
+        selected_columns += columns.len();
+
+        context.push_str(&format!("\n{}", table.name));
+        if let Some(rows) = table.estimated_rows {
+            context.push_str(&format!(" (~{rows} sor)"));
+        }
+        context.push_str(": ");
+        let formatted_columns = columns
+            .into_iter()
+            .map(|(_, _, column)| {
+                let mut flags = Vec::new();
+                if column.key == "PRI" {
+                    flags.push("PK".to_string());
+                } else if column.key == "UNI" {
+                    flags.push("UNIQUE".to_string());
+                }
+                for relationship in table
+                    .relationships
+                    .iter()
+                    .filter(|relationship| relationship.column == column.name)
+                    .take(2)
+                {
+                    flags.push(format!(
+                        "FK->{}.{}",
+                        relationship.referenced_table, relationship.referenced_column
+                    ));
+                }
+                let suffix = if flags.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}]", flags.join(","))
+                };
+                format!("{}:{}{}", column.name, column.column_type, suffix)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        context.push_str(&formatted_columns);
+    }
+
+    let stats = SchemaSelectionStats {
+        total_tables: catalog.tables.len(),
+        total_columns: catalog.tables.iter().map(|table| table.columns.len()).sum(),
+        selected_tables: selected.len(),
+        selected_columns,
+        context_characters: context.len(),
+    };
+    (context, stats)
 }
 
 fn normalize_sql(sql: &str) -> String {
@@ -600,18 +1085,19 @@ async fn call_ai(
     system: &str,
     user: &str,
     json_mode: bool,
-) -> Result<String, String> {
+) -> Result<AiCallResult, String> {
     let endpoint = format!(
         "{}/chat/completions",
         settings.ai_base_url.trim_end_matches('/')
     );
+    let max_completion_tokens = if json_mode { 1_600 } else { 1_200 };
     let mut request = json!({
         "model": settings.ai_model,
         "messages": [
             { "role": "system", "content": system },
             { "role": "user", "content": user }
         ],
-        "max_completion_tokens": 2000
+        "max_completion_tokens": max_completion_tokens
     });
     if json_mode {
         request["response_format"] = json!({ "type": "json_object" });
@@ -634,6 +1120,14 @@ async fn call_ai(
         .await
         .map_err(|error| format!("Az AI-válasz nem olvasható: {error}"))?;
     if !status.is_success() {
+        if let Ok(error_json) = serde_json::from_str::<JsonValue>(&body) {
+            if error_json["error"]["code"].as_str() == Some("credit_balance_exhausted") {
+                return Err(
+                    "Az OpenAI API-egyenlege elfogyott. Tölts fel kreditet az OpenAI Platform Billing oldalon, majd próbáld újra."
+                        .into(),
+                );
+            }
+        }
         let concise = body.chars().take(500).collect::<String>();
         return Err(format!(
             "Az AI-szolgáltatás hibát jelzett ({status}): {concise}"
@@ -642,10 +1136,25 @@ async fn call_ai(
 
     let response_json: JsonValue = serde_json::from_str(&body)
         .map_err(|error| format!("Az AI-válasz formátuma érvénytelen: {error}"))?;
-    response_json["choices"][0]["message"]["content"]
+    let content = response_json["choices"][0]["message"]["content"]
         .as_str()
         .map(str::to_owned)
-        .ok_or_else(|| "Az AI-válasz nem tartalmazott szöveget.".into())
+        .ok_or_else(|| "Az AI-válasz nem tartalmazott szöveget.".to_string())?;
+    let usage = TokenUsage {
+        input_tokens: response_json["usage"]["prompt_tokens"]
+            .as_u64()
+            .unwrap_or_default(),
+        output_tokens: response_json["usage"]["completion_tokens"]
+            .as_u64()
+            .unwrap_or_default(),
+        cached_input_tokens: response_json["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap_or_default(),
+        total_tokens: response_json["usage"]["total_tokens"]
+            .as_u64()
+            .unwrap_or_default(),
+    };
+    Ok(AiCallResult { content, usage })
 }
 
 #[tauri::command]
@@ -665,28 +1174,41 @@ async fn analyze_erp(
         "MySQL-jelszó",
     )?;
     let api_key = read_secret(&app, "AI_API_KEY", AI_API_KEY_ACCOUNT, "AI API-kulcs")?;
-    let schema = inspect_schema(&settings, mysql_password.clone()).await?;
-    let schema_json = serde_json::to_string(&schema)
-        .map_err(|error| format!("A séma nem alakítható át: {error}"))?;
-    let history_text = history
+    let catalog = load_schema_catalog(&app, &settings, mysql_password.clone()).await?;
+    let (schema_context, schema_selection) =
+        select_schema_context(&catalog, question.trim(), &history);
+    let mut relevant_history = history
         .iter()
         .filter(|message| message.role == "user" || message.role == "assistant")
-        .map(|message| format!("{}: {}", message.role, message.content))
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>();
+    relevant_history.reverse();
+    let history_text = relevant_history
+        .into_iter()
+        .map(|message| {
+            let compact_content = message.content.chars().take(700).collect::<String>();
+            format!("{}: {compact_content}", message.role)
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
-    let planner_system = r#"Te az ERGO, a Trans-Europe óvatos ERP-adatelemzője vagy.
+    let planner_system = format!(
+        r#"Te az ERGO, a Trans-Europe óvatos ERP-adatelemzője vagy.
 Készíts pontos MySQL lekérdezési tervet a megadott adatbázis-séma alapján.
 Kizárólag egy SELECT vagy WITH lekérdezést adhatsz. Tilos minden adatmódosítás, DDL, zárolás, fájlművelet, komment, rendszer-séma és több utasítás.
 Ne találj ki táblát vagy oszlopot. Használj explicit oszlopokat és aggregálj SQL-ben. A sorok száma legfeljebb 200 legyen.
 Kizárólag JSON objektummal válaszolj ebben az alakban:
-{"sql":"...","title":"rövid magyar cím","visualization":"table|bar|line","maxRows":50}"#;
+{{"sql":"...","title":"rövid magyar cím","visualization":"table|bar|line","maxRows":50}}
+
+{schema_context}"#
+    );
     let planner_user = format!(
-        "Korábbi beszélgetés:\n{history_text}\n\nFelhasználói kérdés:\n{}\n\nAdatbázis-séma:\n{schema_json}",
+        "Korábbi beszélgetés:\n{history_text}\n\nFelhasználói kérdés:\n{}",
         question.trim()
     );
-    let plan_text = call_ai(&settings, &api_key, planner_system, &planner_user, true).await?;
-    let mut plan: QueryPlan = extract_json(&plan_text)?;
+    let planner_call = call_ai(&settings, &api_key, &planner_system, &planner_user, true).await?;
+    let mut plan: QueryPlan = extract_json(&planner_call.content)?;
     plan.sql = assert_read_only_sql(&plan.sql)?;
     plan.max_rows = plan.max_rows.clamp(1, MAX_RESULT_ROWS);
     if !matches!(plan.visualization.as_str(), "table" | "bar" | "line") {
@@ -695,23 +1217,33 @@ Kizárólag JSON objektummal válaszolj ebben az alakban:
 
     let (columns, rows, truncated) =
         run_query(&settings, mysql_password, &plan.sql, plan.max_rows).await?;
-    let result_preview = serde_json::to_string(&rows)
+    let preview_rows = rows.iter().take(SUMMARY_PREVIEW_ROWS).collect::<Vec<_>>();
+    let full_preview = serde_json::to_string(&preview_rows)
         .map_err(|error| format!("Az eredmény nem alakítható át: {error}"))?;
+    let result_preview = full_preview
+        .chars()
+        .take(SUMMARY_PREVIEW_CHARACTERS)
+        .collect::<String>();
     let summary_system = r#"Te az ERGO, a Trans-Europe üzleti adatelemzője vagy.
 Magyarul válaszolj. Kezdd a legfontosabb üzleti következtetéssel, majd támaszd alá a kapott számokkal.
 Ne találj ki adatot, pénznemet, mértékegységet vagy üzleti definíciót. Ha az eredmény üres vagy kétértelmű, ezt mondd ki.
-Legyél tömör, gyakorlatias, és jelezd, ha a látható eredmény korlátozott. Markdown használható."#;
+Legyél tömör és gyakorlatias, legfeljebb 180 szóban. Jelezd, ha a látható eredmény korlátozott. Markdown használható."#;
     let summary_user = format!(
-        "Eredeti kérdés: {}\n\nLekérdezési eredmény (JSON):\n{}\n\nCsonkolt eredmény: {}",
+        "Eredeti kérdés: {}\n\nLekérdezési eredmény első {} sora (JSON, legfeljebb {} karakter):\n{}\n\nTeljes visszaadott sorszám: {}\nAdatbázis-lekérdezés csonkolt: {}",
         question.trim(),
+        SUMMARY_PREVIEW_ROWS,
+        SUMMARY_PREVIEW_CHARACTERS,
         result_preview,
+        rows.len(),
         truncated
     );
-    let summary = call_ai(&settings, &api_key, summary_system, &summary_user, false).await?;
+    let summary_call = call_ai(&settings, &api_key, summary_system, &summary_user, false).await?;
+    let mut token_usage = planner_call.usage;
+    token_usage.add(&summary_call.usage);
     let row_count = rows.len();
 
     Ok(AnalyzeResponse {
-        summary,
+        summary: summary_call.content,
         result: QueryResult {
             kind: "query-result",
             title: plan.title,
@@ -721,6 +1253,8 @@ Legyél tömör, gyakorlatias, és jelezd, ha a látható eredmény korlátozott
             row_count,
             truncated,
             sql: plan.sql,
+            token_usage,
+            schema_selection,
         },
     })
 }
@@ -741,7 +1275,11 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{assert_read_only_sql, extract_json, is_chat_model, validate_model, QueryPlan};
+    use super::{
+        assert_read_only_sql, extract_json, is_chat_model, schema_search_terms,
+        select_schema_context, validate_model, CatalogColumn, QueryPlan, SchemaCatalog,
+        SchemaTable,
+    };
 
     #[test]
     fn accepts_a_single_select() {
@@ -780,5 +1318,67 @@ mod tests {
     fn validates_model_identifiers() {
         assert_eq!(validate_model("gpt-5.6-terra").unwrap(), "gpt-5.6-terra");
         assert!(validate_model("../invalid model").is_err());
+    }
+
+    #[test]
+    fn expands_hungarian_business_terms() {
+        let terms = schema_search_terms("Mutasd a lejárt kintlévőségeket", &[]);
+        assert!(terms.contains("customerentry"));
+        assert!(terms.contains("duedate"));
+        assert!(terms.contains("remainder"));
+    }
+
+    #[test]
+    fn selects_only_relevant_schema_context() {
+        let catalog = SchemaCatalog {
+            database: "test".into(),
+            source: "localhost/test".into(),
+            generated_at: 0,
+            tables: vec![
+                SchemaTable {
+                    name: "customerentry".into(),
+                    table_type: "BASE TABLE".into(),
+                    estimated_rows: Some(100),
+                    columns: vec![
+                        CatalogColumn {
+                            name: "customernumber".into(),
+                            column_type: "varchar(255)".into(),
+                            nullable: false,
+                            key: "MUL".into(),
+                        },
+                        CatalogColumn {
+                            name: "duedate".into(),
+                            column_type: "varchar(12)".into(),
+                            nullable: false,
+                            key: String::new(),
+                        },
+                        CatalogColumn {
+                            name: "remainderbase".into(),
+                            column_type: "decimal(20,2)".into(),
+                            nullable: false,
+                            key: String::new(),
+                        },
+                    ],
+                    relationships: vec![],
+                },
+                SchemaTable {
+                    name: "employee".into(),
+                    table_type: "BASE TABLE".into(),
+                    estimated_rows: Some(10),
+                    columns: vec![CatalogColumn {
+                        name: "employeenumber".into(),
+                        column_type: "varchar(255)".into(),
+                        nullable: false,
+                        key: "PRI".into(),
+                    }],
+                    relationships: vec![],
+                },
+            ],
+        };
+        let (context, stats) = select_schema_context(&catalog, "Mennyi a lejárt kintlévőség?", &[]);
+        assert!(context.contains("customerentry"));
+        assert!(!context.contains("employee"));
+        assert_eq!(stats.selected_tables, 1);
+        assert_eq!(stats.total_columns, 4);
     }
 }

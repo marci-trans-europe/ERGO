@@ -54,6 +54,17 @@ A chat fejlécében lévő modellválasztó az API által elérhetővé tett GPT
 reasoning modelleket listázza. A választás helyben mentődik, és a következő
 indításkor is megmarad.
 
+## Tokenhatékony sémafeldolgozás
+
+Az alkalmazás nem küldi el a teljes adatbázissémát minden kérdéssel. A táblák,
+oszlopok és idegen kulcsok katalógusát 24 órára helyben gyorsítótárazza, majd a
+magyar üzleti kérdés alapján legfeljebb 8 releváns táblát és táblánként 36
+fontos oszlopot választ ki. A séma teljes tartalma nem kerül a GitHubra.
+
+Az eredménykártya megmutatja a kiválasztott és teljes séma méretét, valamint az
+OpenAI által visszaadott input-, output- és cache-tokenek számát. A második,
+összefoglaló AI-hívás legfeljebb 40 eredménysort és 18 000 karaktert kap meg.
+
 Más OpenAI-kompatibilis szolgáltatás használatakor az API-címet és a modell
 azonosítóját a kapcsolati beállításokban kell módosítani.
 

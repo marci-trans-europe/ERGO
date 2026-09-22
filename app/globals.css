@@ -886,6 +886,13 @@ button:disabled {
   font-size: 0.61rem;
 }
 
+.result-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px 14px;
+}
+
 .result-card details {
   position: relative;
 }
