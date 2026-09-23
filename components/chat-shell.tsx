@@ -15,6 +15,7 @@ import {
 
 import { MessageView } from '@/components/message-view'
 import { SettingsDialog } from '@/components/settings-dialog'
+import { useAppUpdater } from '@/components/use-app-updater'
 import { useErpChat } from '@/components/use-erp-chat'
 
 const quickPrompts = [
@@ -52,6 +53,7 @@ const modelLabels: Record<string, string> = {
 const modelLabel = (model: string) => modelLabels[model] ?? model
 
 export const ChatShell = () => {
+  const updater = useAppUpdater()
   const {
     availableModels,
     changeModel,
@@ -120,12 +122,17 @@ export const ChatShell = () => {
           </div>
 
           <button
-            className="logout-button"
+            className={`logout-button ${
+              updater.state.status === 'available' ? 'has-update' : ''
+            }`}
             onClick={() => setSettingsOpen(true)}
             type="button"
           >
             <Settings aria-hidden="true" size={16} />
             Kapcsolati beállítások
+            {updater.state.status === 'available' ? (
+              <span className="update-dot" aria-label="Frissítés érhető el" />
+            ) : null}
           </button>
         </aside>
 
@@ -243,9 +250,12 @@ export const ChatShell = () => {
       </div>
       {settingsOpen ? (
         <SettingsDialog
+          onCheckForUpdate={() => updater.checkForUpdate()}
           onClose={() => setSettingsOpen(false)}
+          onInstallUpdate={updater.installUpdate}
           onSaved={refreshSettings}
           settings={settings}
+          updateState={updater.state}
         />
       ) : null}
     </>

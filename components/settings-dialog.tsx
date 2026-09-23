@@ -5,9 +5,14 @@ import { FormEvent, useState } from 'react'
 
 import { checkDatabase, saveSettings } from '@/lib/desktop'
 import type { DesktopSettings, SettingsInput } from '@/lib/types'
+import type { AppUpdateState } from '@/components/use-app-updater'
+import { UpdateSettings } from '@/components/update-settings'
 
 type SettingsDialogProps = {
   settings: DesktopSettings | null
+  updateState: AppUpdateState
+  onCheckForUpdate: () => Promise<void>
+  onInstallUpdate: () => Promise<void>
   onClose: () => void
   onSaved: () => Promise<void>
 }
@@ -31,9 +36,12 @@ const errorText = (error: unknown): string => {
 }
 
 export const SettingsDialog = ({
+  onCheckForUpdate,
   onClose,
+  onInstallUpdate,
   onSaved,
   settings,
+  updateState,
 }: SettingsDialogProps) => {
   const [form, setForm] = useState<SettingsInput>(() =>
     settings
@@ -203,6 +211,12 @@ export const SettingsDialog = ({
               </label>
             </div>
           </fieldset>
+
+          <UpdateSettings
+            onCheck={onCheckForUpdate}
+            onInstall={onInstallUpdate}
+            state={updateState}
+          />
 
           <p className="settings-note">
             Az itt megadott titkok a macOS Kulcskarikába kerülnek. A gépenkénti

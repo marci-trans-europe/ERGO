@@ -374,7 +374,21 @@ button:disabled {
 }
 
 .logout-button {
+  position: relative;
   margin-top: 12px;
+}
+
+.logout-button.has-update {
+  color: #f2d0c2;
+}
+
+.update-dot {
+  width: 8px;
+  height: 8px;
+  margin-left: auto;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 4px rgba(217, 103, 63, 0.14);
 }
 
 .chat-main {
@@ -1228,6 +1242,105 @@ button:disabled {
   margin: 0;
   color: var(--red);
   font-size: 0.78rem;
+}
+
+.update-settings {
+  display: grid;
+  gap: 14px;
+}
+
+.update-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.update-summary div {
+  display: grid;
+  gap: 4px;
+}
+
+.update-summary strong {
+  color: var(--ink);
+  font-size: 0.84rem;
+}
+
+.update-summary span,
+.update-progress > span,
+.update-restart-label {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.update-ok {
+  flex: 0 0 auto;
+  color: var(--green);
+}
+
+.update-notes {
+  max-height: 100px;
+  overflow: auto;
+  margin: 0;
+  padding: 11px 12px;
+  border-radius: 10px 3px 10px 3px;
+  background: #f3f5f2;
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.5;
+  white-space: pre-line;
+}
+
+.update-progress {
+  display: grid;
+  gap: 7px;
+}
+
+.update-progress-track {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e5e9e4;
+}
+
+.update-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 160ms ease;
+}
+
+.update-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+}
+
+.update-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--line);
+  border-radius: 10px 3px 10px 3px;
+  padding: 9px 12px;
+  background: white;
+  cursor: pointer;
+  font-size: 0.74rem;
+  font-weight: 700;
+}
+
+.update-actions .update-install-button {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: white;
+}
+
+.update-restart-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
 }
 
 .settings-actions {

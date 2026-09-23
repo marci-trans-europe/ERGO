@@ -1261,6 +1261,8 @@ Legyél tömör és gyakorlatias, legfeljebb 180 szóban. Jelezd, ha a látható
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             analyze_erp,
             check_database,
