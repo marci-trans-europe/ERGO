@@ -1,6 +1,6 @@
 [package]
 name = "ergo-desktop"
-version = "0.3.1"
+version = "0.3.2"
 description = "Trans-Europe ERGO read-only ERP analyst"
 authors = ["Trans-Europe Zrt."]
 edition = "2021"

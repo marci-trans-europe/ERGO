@@ -94,14 +94,14 @@ export const FeedbackWidget = () => {
         aria-label={isOpen ? 'Visszajelzés bezárása' : 'Visszajelzés küldése'}
         className="feedback-trigger"
         onClick={() => setIsOpen((current) => !current)}
+        title={isOpen ? 'Bezárás' : 'Visszajelzés küldése'}
         type="button"
       >
         {isOpen ? (
-          <X aria-hidden="true" size={20} />
+          <X aria-hidden="true" size={17} />
         ) : (
-          <MessageCircle aria-hidden="true" size={20} />
+          <MessageCircle aria-hidden="true" size={17} />
         )}
-        <span>{isOpen ? 'Bezárás' : 'Visszajelzés'}</span>
       </button>
     </aside>
   )

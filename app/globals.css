@@ -1377,7 +1377,7 @@ button:disabled {
   position: fixed;
   z-index: 40;
   right: 22px;
-  bottom: 20px;
+  bottom: 88px;
   display: grid;
   justify-items: end;
   gap: 10px;
@@ -1386,15 +1386,15 @@ button:disabled {
 .feedback-trigger {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
   border: 0;
   border-radius: 14px 5px 14px 5px;
-  padding: 11px 14px;
+  padding: 0;
   background: var(--forest);
   color: white;
   cursor: pointer;
-  font-size: 0.74rem;
-  font-weight: 750;
   box-shadow: 0 12px 36px rgba(16, 40, 36, 0.24);
 }
 
@@ -1660,11 +1660,7 @@ button:disabled {
 
   .feedback-widget {
     right: 12px;
-    bottom: 12px;
-  }
-
-  .feedback-trigger span {
-    display: none;
+    bottom: 82px;
   }
 
   .feedback-panel {
