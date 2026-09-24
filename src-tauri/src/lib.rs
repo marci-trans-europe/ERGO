@@ -1454,6 +1454,7 @@ async fn analyze_erp(
         r#"Te az ERGO, a Trans-Europe óvatos ERP-adatelemzője vagy.
 Készíts pontos MySQL lekérdezési tervet a megadott adatbázis-séma alapján.
 Kizárólag egy SELECT vagy WITH lekérdezést adhatsz. Tilos minden adatmódosítás, DDL, zárolás, fájlművelet, komment, rendszer-séma és több utasítás.
+Az sql mező pontosan egyetlen SELECT vagy WITH utasítást tartalmazzon, záró pontosvessző nélkül. Ne használj SET, DECLARE, ideiglenes táblát vagy tárolt eljárást.
 Ne találj ki táblát vagy oszlopot. Használj explicit oszlopokat és aggregálj SQL-ben. A sorok száma legfeljebb 200 legyen.
 Az üzleti kategóriát és a táblaleírást tekintsd mérvadónak; az azonos szavakat tartalmazó, de más üzleti célú táblákat ne keverd össze.
 Időfüggő üzleti adatoknál kötelező közvetlenül az SQL WHERE feltételében időszakot szűrni:
@@ -1473,8 +1474,37 @@ Kizárólag JSON objektummal válaszolj ebben az alakban:
         question.trim()
     );
     let planner_call = call_ai(&settings, &api_key, &planner_system, &planner_user, true).await?;
+    let mut planner_usage = planner_call.usage;
     let mut plan: QueryPlan = extract_json(&planner_call.content)?;
-    plan.sql = assert_read_only_sql(&plan.sql)?;
+    plan.sql = match assert_read_only_sql(&plan.sql) {
+        Ok(sql) => sql,
+        Err(first_error) => {
+            let repair_user = format!(
+                r#"Az előző lekérdezési terv biztonsági ellenőrzése sikertelen volt.
+Hiba: {first_error}
+
+Hibás SQL:
+{}
+
+Eredeti felhasználói kérdés:
+{}
+
+Javítsd ki a tervet. A JSON sql mezője pontosan egyetlen, záró pontosvessző nélküli SELECT vagy WITH utasítás legyen. Ne használj SET, DECLARE, ideiglenes táblát, tárolt eljárást, kommentet vagy több utasítást. Kizárólag a kért JSON objektummal válaszolj."#,
+                plan.sql,
+                question.trim()
+            );
+            let repaired_call =
+                call_ai(&settings, &api_key, &planner_system, &repair_user, true).await?;
+            planner_usage.add(&repaired_call.usage);
+            let repaired_plan: QueryPlan = extract_json(&repaired_call.content)?;
+            plan = repaired_plan;
+            assert_read_only_sql(&plan.sql).map_err(|second_error| {
+                format!(
+                    "Az AI két próbálkozás után sem adott biztonságos, egyetlen SELECT lekérdezést: {second_error}"
+                )
+            })?
+        }
+    };
     plan.max_rows = plan.max_rows.clamp(1, MAX_RESULT_ROWS);
     if !matches!(plan.visualization.as_str(), "table" | "bar" | "line") {
         plan.visualization = "table".into();
@@ -1503,7 +1533,7 @@ Legyél tömör és gyakorlatias, legfeljebb 180 szóban. Jelezd, ha a látható
         truncated
     );
     let summary_call = call_ai(&settings, &api_key, summary_system, &summary_user, false).await?;
-    let mut token_usage = planner_call.usage;
+    let mut token_usage = planner_usage;
     token_usage.add(&summary_call.usage);
     let row_count = rows.len();
 
