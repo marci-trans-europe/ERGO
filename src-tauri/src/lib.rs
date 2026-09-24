@@ -3,6 +3,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     fs,
     path::PathBuf,
+    process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -24,6 +25,11 @@ const MAX_SCHEMA_COLUMNS_PER_TABLE: usize = 36;
 const SCHEMA_CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const SUMMARY_PREVIEW_ROWS: usize = 40;
 const SUMMARY_PREVIEW_CHARACTERS: usize = 18_000;
+const FEEDBACK_EMAIL: &str = "marton.trautmann@icloud.com";
+
+fn default_analysis_fy_window() -> u8 {
+    5
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +41,8 @@ struct StoredSettings {
     mysql_ssl: bool,
     ai_base_url: String,
     ai_model: String,
+    #[serde(default = "default_analysis_fy_window")]
+    analysis_fy_window: u8,
 }
 
 impl Default for StoredSettings {
@@ -46,7 +54,8 @@ impl Default for StoredSettings {
             mysql_user: "TREU".into(),
             mysql_ssl: false,
             ai_base_url: "https://api.openai.com/v1".into(),
-            ai_model: "gpt-6-astra".into(),
+            ai_model: "gpt-6-sol".into(),
+            analysis_fy_window: default_analysis_fy_window(),
         }
     }
 }
@@ -62,6 +71,7 @@ struct SettingsInput {
     mysql_password: String,
     ai_base_url: String,
     ai_model: String,
+    analysis_fy_window: u8,
     ai_api_key: String,
 }
 
@@ -75,6 +85,7 @@ struct PublicSettings {
     mysql_ssl: bool,
     ai_base_url: String,
     ai_model: String,
+    analysis_fy_window: u8,
     has_mysql_password: bool,
     has_ai_api_key: bool,
 }
@@ -112,7 +123,8 @@ struct QueryResult {
 #[derive(Debug, Serialize)]
 struct AnalyzeResponse {
     summary: String,
-    result: QueryResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<QueryResult>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -310,6 +322,7 @@ fn public_settings(app: &AppHandle, settings: StoredSettings) -> PublicSettings 
         mysql_ssl: settings.mysql_ssl,
         ai_base_url: settings.ai_base_url,
         ai_model: settings.ai_model,
+        analysis_fy_window: settings.analysis_fy_window,
         has_mysql_password: secret_exists(app, "MYSQL_PASSWORD", MYSQL_PASSWORD_ACCOUNT),
         has_ai_api_key: secret_exists(app, "AI_API_KEY", AI_API_KEY_ACCOUNT),
     }
@@ -330,7 +343,16 @@ fn validate_settings(settings: &SettingsInput) -> Result<(), String> {
         return Err("Az AI API-címnek HTTPS-címet kell használnia.".into());
     }
     validate_model(&settings.ai_model)?;
+    validate_analysis_fy_window(settings.analysis_fy_window)?;
     Ok(())
+}
+
+fn validate_analysis_fy_window(years: u8) -> Result<u8, String> {
+    if matches!(years, 1 | 3 | 5) {
+        Ok(years)
+    } else {
+        Err("Az elemzési időablak csak 1, 3 vagy 5 üzleti év lehet.".into())
+    }
 }
 
 fn validate_model(model: &str) -> Result<&str, String> {
@@ -397,6 +419,7 @@ fn save_settings(app: AppHandle, settings: SettingsInput) -> Result<PublicSettin
         mysql_ssl: settings.mysql_ssl,
         ai_base_url: settings.ai_base_url.trim().trim_end_matches('/').into(),
         ai_model: settings.ai_model.trim().into(),
+        analysis_fy_window: settings.analysis_fy_window,
     };
     write_settings(&app, &stored)?;
     Ok(public_settings(&app, stored))
@@ -408,6 +431,58 @@ fn select_ai_model(app: AppHandle, model: String) -> Result<PublicSettings, Stri
     settings.ai_model = validate_model(&model)?.into();
     write_settings(&app, &settings)?;
     Ok(public_settings(&app, settings))
+}
+
+#[tauri::command]
+fn select_analysis_fy_window(app: AppHandle, years: u8) -> Result<PublicSettings, String> {
+    let mut settings = read_settings(&app)?;
+    settings.analysis_fy_window = validate_analysis_fy_window(years)?;
+    write_settings(&app, &settings)?;
+    Ok(public_settings(&app, settings))
+}
+
+fn percent_encode_mailto(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn open_feedback_email(app: AppHandle, message: String) -> Result<(), String> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return Err("A visszajelzés nem lehet üres.".into());
+    }
+    if trimmed.chars().count() > 2_000 {
+        return Err("A visszajelzés legfeljebb 2000 karakter lehet.".into());
+    }
+    let settings = read_settings(&app)?;
+    let subject = format!("ERGO {} visszajelzés", env!("CARGO_PKG_VERSION"));
+    let body = format!(
+        "ERGO visszajelzés\n\n{trimmed}\n\n---\nVerzió: {}\nModell: {}\nElemzési időablak: {} FY\nRendszer: {} {}\n\nA levél nem tartalmaz automatikusan ERP-adatot vagy lekérdezési eredményt.",
+        env!("CARGO_PKG_VERSION"),
+        settings.ai_model,
+        settings.analysis_fy_window,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    let mailto = format!(
+        "mailto:{FEEDBACK_EMAIL}?subject={}&body={}",
+        percent_encode_mailto(&subject),
+        percent_encode_mailto(&body)
+    );
+
+    Command::new("open")
+        .arg(mailto)
+        .spawn()
+        .map_err(|error| format!("A levelezőalkalmazás nem nyitható meg: {error}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -651,6 +726,42 @@ fn normalize_for_search(value: &str) -> String {
         .collect()
 }
 
+fn capability_answer(question: &str) -> Option<&'static str> {
+    let normalized = normalize_for_search(question);
+    let capability_phrases = [
+        "milyen adatokbol tudsz",
+        "milyen adatokkal tudsz",
+        "milyen adatokat ersz el",
+        "milyen adatokat latsz",
+        "milyen adatokat tudsz",
+        "milyen elemzeseket tudsz",
+        "miben tudsz segiteni",
+        "mire vagy kepes",
+        "mit tudsz",
+        "mi van az adatbazisban",
+    ];
+    if !capability_phrases
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+    {
+        return None;
+    }
+
+    Some(
+        r#"A **Trans-Europe Zrt. köztes, csak olvasható ERP-adatbázisában** található átfogó üzleti adatokból tudok dolgozni.
+
+Többek között képes vagyok:
+
+- napi, havi vagy egyedi időszakra vonatkozó kimenő és bejövő számlákat, valamint számlatételeket kilistázni;
+- árbevételt, költségeket, kintlévőségeket, fizetéseket és főkönyvi adatokat elemezni;
+- vevői, szállítói, rendelési, fuvarozási és egyéb ERP-adatokat összesíteni;
+- trendeket, eltéréseket és kiemelkedő értékeket azonosítani;
+- az eredményeket táblázatban, illetve oszlop- vagy vonaldiagramon megjeleníteni.
+
+Az adatokat nem módosítom. A lekérdezéseket a kérdésben megadott időszakra, illetve a fejlécben kiválasztott 1, 3 vagy 5 üzletiéves időablakra szűkítem."#,
+    )
+}
+
 fn schema_search_terms(question: &str, history: &[HistoryMessage]) -> HashSet<String> {
     let stop_words = [
         "adat", "adatok", "alapjan", "az", "egy", "es", "hogy", "kerlek", "legyen", "meg", "mely",
@@ -759,6 +870,79 @@ fn schema_search_terms(question: &str, history: &[HistoryMessage]) -> HashSet<St
         }
     }
     terms
+}
+
+fn table_business_metadata(table_name: &str) -> (&'static str, Option<&'static str>) {
+    let name = table_name.to_ascii_lowercase();
+    let description = match name.as_str() {
+        "invoice" => Some("kimenő számlák fejléce; egy sor egy számla"),
+        "invoiceline" => Some("kimenő számlák tételsorai"),
+        "invoicevatspecification" => Some("kimenő számlák áfabontása"),
+        "invoiceallocationline" => {
+            Some("bejövő szállítói számlák könyvelési felosztása; nem kimenő számla")
+        }
+        "vendorinvoicejournal" => Some("bejövő szállítói számlanapló; nem kimenő számla"),
+        "purchasevoucher" => Some("könyvelt szállítói bizonylatok és bejövő számlák"),
+        "customerentry" => Some("vevői folyószámla- és kintlévőségi tételek"),
+        "vendorentry" => Some("szállítói folyószámla-tételek"),
+        "customerpayment" => Some("vevői befizetések és kiegyenlítések"),
+        "vendorpayment" => Some("szállítói kifizetések és kiegyenlítések"),
+        "orderheader" => Some("értékesítési rendelések fejléce"),
+        "orderline" => Some("értékesítési rendelések tételsorai"),
+        "deliverynote" => Some("szállítólevelek fejléce"),
+        "deliverynoteline" => Some("szállítólevelek tételsorai"),
+        "financeentry" => Some("főkönyvi könyvelési tételek"),
+        "customer" | "companycustomer" => Some("vevői törzsadatok"),
+        "vendor" | "companyvendor" => Some("szállítói törzsadatok"),
+        _ => None,
+    };
+    let category = if name.starts_with("invoice")
+        || name.starts_with("customer")
+        || name.starts_with("order")
+        || name.starts_with("deliverynote")
+    {
+        "Értékesítés és kimenő számlázás"
+    } else if name.starts_with("vendor")
+        || name.starts_with("purchase")
+        || name.starts_with("itempurchase")
+    {
+        "Beszerzés és bejövő számlázás"
+    } else if name.contains("finance")
+        || name.starts_with("account")
+        || name.contains("journal")
+        || name.contains("vat")
+        || name.contains("fiscal")
+    {
+        "Pénzügy és főkönyv"
+    } else if name.starts_with("job")
+        || name.contains("traffic")
+        || name.contains("freight")
+        || name.starts_with("transport")
+    {
+        "Fuvarozás és munkák"
+    } else if name.starts_with("item")
+        || name.contains("inventory")
+        || name.contains("warehouse")
+        || name.contains("stock")
+    {
+        "Készlet és termékek"
+    } else if name.starts_with("employee")
+        || name.starts_with("timesheet")
+        || name.contains("absence")
+        || name.contains("salary")
+    {
+        "Munkaügy és időráfordítás"
+    } else if name.starts_with("company")
+        || name.starts_with("system")
+        || name.contains("user")
+        || name.contains("role")
+        || name.contains("parameter")
+    {
+        "Törzsadat és rendszerbeállítás"
+    } else {
+        "Egyéb ERP-adat"
+    };
+    (category, description)
 }
 
 fn select_schema_context(
@@ -889,7 +1073,11 @@ fn select_schema_context(
         columns.sort_by_key(|(_, index, _)| *index);
         selected_columns += columns.len();
 
-        context.push_str(&format!("\n{}", table.name));
+        let (category, description) = table_business_metadata(&table.name);
+        context.push_str(&format!("\n[{}] {}", category, table.name));
+        if let Some(description) = description {
+            context.push_str(&format!(" — {description}"));
+        }
         if let Some(rows) = table.estimated_rows {
             context.push_str(&format!(" (~{rows} sor)"));
         }
@@ -1079,6 +1267,14 @@ fn extract_json<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T, String> {
         .map_err(|error| format!("Az AI lekérdezési terve érvénytelen: {error}"))
 }
 
+fn responses_input(user: &str, json_mode: bool) -> String {
+    if json_mode {
+        format!("A válasz kizárólag JSON objektum legyen.\n\n{user}")
+    } else {
+        user.to_string()
+    }
+}
+
 async fn call_ai(
     settings: &StoredSettings,
     api_key: &str,
@@ -1086,20 +1282,39 @@ async fn call_ai(
     user: &str,
     json_mode: bool,
 ) -> Result<AiCallResult, String> {
-    let endpoint = format!(
-        "{}/chat/completions",
-        settings.ai_base_url.trim_end_matches('/')
-    );
+    let uses_responses_api =
+        settings.ai_model.starts_with("gpt-5") || settings.ai_model.starts_with("gpt-6");
+    let endpoint = if uses_responses_api {
+        format!("{}/responses", settings.ai_base_url.trim_end_matches('/'))
+    } else {
+        format!(
+            "{}/chat/completions",
+            settings.ai_base_url.trim_end_matches('/')
+        )
+    };
     let max_completion_tokens = if json_mode { 1_600 } else { 1_200 };
-    let mut request = json!({
-        "model": settings.ai_model,
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user", "content": user }
-        ],
-        "max_completion_tokens": max_completion_tokens
-    });
-    if json_mode {
+    let responses_input = responses_input(user, json_mode);
+    let mut request = if uses_responses_api {
+        json!({
+            "model": settings.ai_model,
+            "instructions": system,
+            "input": responses_input,
+            "max_output_tokens": max_completion_tokens,
+            "store": false
+        })
+    } else {
+        json!({
+            "model": settings.ai_model,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user }
+            ],
+            "max_completion_tokens": max_completion_tokens
+        })
+    };
+    if json_mode && uses_responses_api {
+        request["text"] = json!({ "format": { "type": "json_object" } });
+    } else if json_mode {
         request["response_format"] = json!({ "type": "json_object" });
     }
 
@@ -1136,23 +1351,54 @@ async fn call_ai(
 
     let response_json: JsonValue = serde_json::from_str(&body)
         .map_err(|error| format!("Az AI-válasz formátuma érvénytelen: {error}"))?;
-    let content = response_json["choices"][0]["message"]["content"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| "Az AI-válasz nem tartalmazott szöveget.".to_string())?;
-    let usage = TokenUsage {
-        input_tokens: response_json["usage"]["prompt_tokens"]
-            .as_u64()
-            .unwrap_or_default(),
-        output_tokens: response_json["usage"]["completion_tokens"]
-            .as_u64()
-            .unwrap_or_default(),
-        cached_input_tokens: response_json["usage"]["prompt_tokens_details"]["cached_tokens"]
-            .as_u64()
-            .unwrap_or_default(),
-        total_tokens: response_json["usage"]["total_tokens"]
-            .as_u64()
-            .unwrap_or_default(),
+    let (content, usage) = if uses_responses_api {
+        let content = response_json["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item["content"].as_array())
+            .flatten()
+            .find_map(|content| {
+                (content["type"].as_str() == Some("output_text"))
+                    .then(|| content["text"].as_str().map(str::to_owned))
+                    .flatten()
+            })
+            .ok_or_else(|| "Az AI-válasz nem tartalmazott szöveget.".to_string())?;
+        let usage = TokenUsage {
+            input_tokens: response_json["usage"]["input_tokens"]
+                .as_u64()
+                .unwrap_or_default(),
+            output_tokens: response_json["usage"]["output_tokens"]
+                .as_u64()
+                .unwrap_or_default(),
+            cached_input_tokens: response_json["usage"]["input_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or_default(),
+            total_tokens: response_json["usage"]["total_tokens"]
+                .as_u64()
+                .unwrap_or_default(),
+        };
+        (content, usage)
+    } else {
+        let content = response_json["choices"][0]["message"]["content"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "Az AI-válasz nem tartalmazott szöveget.".to_string())?;
+        let usage = TokenUsage {
+            input_tokens: response_json["usage"]["prompt_tokens"]
+                .as_u64()
+                .unwrap_or_default(),
+            output_tokens: response_json["usage"]["completion_tokens"]
+                .as_u64()
+                .unwrap_or_default(),
+            cached_input_tokens: response_json["usage"]["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or_default(),
+            total_tokens: response_json["usage"]["total_tokens"]
+                .as_u64()
+                .unwrap_or_default(),
+        };
+        (content, usage)
     };
     Ok(AiCallResult { content, usage })
 }
@@ -1165,6 +1411,12 @@ async fn analyze_erp(
 ) -> Result<AnalyzeResponse, String> {
     if question.trim().is_empty() {
         return Err("A kérdés nem lehet üres.".into());
+    }
+    if let Some(summary) = capability_answer(question.trim()) {
+        return Ok(AnalyzeResponse {
+            summary: summary.into(),
+            result: None,
+        });
     }
     let settings = read_settings(&app)?;
     let mysql_password = read_secret(
@@ -1193,11 +1445,24 @@ async fn analyze_erp(
         .collect::<Vec<_>>()
         .join("\n");
 
+    let analysis_fy_window = validate_analysis_fy_window(settings.analysis_fy_window)?;
+    let fiscal_year_start = format!(
+        "MAKEDATE(YEAR(CURRENT_DATE) - {}, 1)",
+        analysis_fy_window - 1
+    );
     let planner_system = format!(
         r#"Te az ERGO, a Trans-Europe óvatos ERP-adatelemzője vagy.
 Készíts pontos MySQL lekérdezési tervet a megadott adatbázis-séma alapján.
 Kizárólag egy SELECT vagy WITH lekérdezést adhatsz. Tilos minden adatmódosítás, DDL, zárolás, fájlművelet, komment, rendszer-séma és több utasítás.
 Ne találj ki táblát vagy oszlopot. Használj explicit oszlopokat és aggregálj SQL-ben. A sorok száma legfeljebb 200 legyen.
+Az üzleti kategóriát és a táblaleírást tekintsd mérvadónak; az azonos szavakat tartalmazó, de más üzleti célú táblákat ne keverd össze.
+Időfüggő üzleti adatoknál kötelező közvetlenül az SQL WHERE feltételében időszakot szűrni:
+- ha a kérdés napot vagy időszakot ad meg (például ma, tegnap, adott hónap), pontosan arra, és ne olvass be azon kívüli rekordot;
+- a beállított elemzési időablak {analysis_fy_window} FY; ennek kezdete {fiscal_year_start};
+- külön időszak hiányában ettől a kezdettől szűrj;
+- a beállított {analysis_fy_window} FY időablaknál régebbi tranzakciót akkor se használj, ha a felhasználó tágabb időszakot kér;
+- dátumként tárolt varchar mezőnél vedd figyelembe a sémában jelzett típust és a ponttal tagolt YYYY.MM.DD formátumot;
+- fejlécszámhoz ne kapcsolj tételtáblát, ha a kérdés nem kér tételszintű adatot.
 Kizárólag JSON objektummal válaszolj ebben az alakban:
 {{"sql":"...","title":"rövid magyar cím","visualization":"table|bar|line","maxRows":50}}
 
@@ -1244,7 +1509,7 @@ Legyél tömör és gyakorlatias, legfeljebb 180 szóban. Jelezd, ha a látható
 
     Ok(AnalyzeResponse {
         summary: summary_call.content,
-        result: QueryResult {
+        result: Some(QueryResult {
             kind: "query-result",
             title: plan.title,
             visualization: plan.visualization,
@@ -1255,7 +1520,7 @@ Legyél tömör és gyakorlatias, legfeljebb 180 szóban. Jelezd, ha a látható
             sql: plan.sql,
             token_usage,
             schema_selection,
-        },
+        }),
     })
 }
 
@@ -1268,8 +1533,10 @@ pub fn run() {
             check_database,
             list_ai_models,
             load_settings,
+            open_feedback_email,
             save_settings,
-            select_ai_model
+            select_ai_model,
+            select_analysis_fy_window
         ])
         .run(tauri::generate_context!())
         .expect("az ERGO alkalmazás nem indítható");
@@ -1278,9 +1545,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_read_only_sql, extract_json, is_chat_model, schema_search_terms,
-        select_schema_context, validate_model, CatalogColumn, QueryPlan, SchemaCatalog,
-        SchemaTable,
+        assert_read_only_sql, capability_answer, extract_json, is_chat_model,
+        percent_encode_mailto, responses_input, schema_search_terms, select_schema_context,
+        table_business_metadata, validate_analysis_fy_window, validate_model, CatalogColumn,
+        QueryPlan, SchemaCatalog, SchemaTable,
     };
 
     #[test]
@@ -1309,6 +1577,14 @@ mod tests {
     }
 
     #[test]
+    fn mentions_json_in_structured_responses_input() {
+        let input = responses_input("Készíts lekérdezési tervet.", true);
+        assert!(input.to_lowercase().contains("json"));
+        assert!(input.contains("Készíts lekérdezési tervet."));
+        assert_eq!(responses_input("Egyszerű kérdés", false), "Egyszerű kérdés");
+    }
+
+    #[test]
     fn filters_non_chat_models() {
         assert!(is_chat_model("gpt-6-astra"));
         assert!(is_chat_model("o3"));
@@ -1323,11 +1599,47 @@ mod tests {
     }
 
     #[test]
+    fn validates_supported_fiscal_year_windows() {
+        assert_eq!(validate_analysis_fy_window(1).unwrap(), 1);
+        assert_eq!(validate_analysis_fy_window(3).unwrap(), 3);
+        assert_eq!(validate_analysis_fy_window(5).unwrap(), 5);
+        assert!(validate_analysis_fy_window(2).is_err());
+    }
+
+    #[test]
+    fn encodes_feedback_for_a_mailto_url() {
+        assert_eq!(
+            percent_encode_mailto("Hiba és kérdés"),
+            "Hiba%20%C3%A9s%20k%C3%A9rd%C3%A9s"
+        );
+    }
+
+    #[test]
     fn expands_hungarian_business_terms() {
         let terms = schema_search_terms("Mutasd a lejárt kintlévőségeket", &[]);
         assert!(terms.contains("customerentry"));
         assert!(terms.contains("duedate"));
         assert!(terms.contains("remainder"));
+    }
+
+    #[test]
+    fn answers_capability_questions_without_a_query() {
+        let answer = capability_answer("Milyen adatokból tudsz dolgozni?").unwrap();
+        assert!(answer.contains("Trans-Europe Zrt."));
+        assert!(answer.contains("1, 3 vagy 5 üzletiéves"));
+        assert!(capability_answer("Mennyi a mai árbevétel?").is_none());
+    }
+
+    #[test]
+    fn distinguishes_outgoing_and_incoming_invoice_tables() {
+        assert_eq!(
+            table_business_metadata("invoice").1,
+            Some("kimenő számlák fejléce; egy sor egy számla")
+        );
+        assert!(table_business_metadata("vendorinvoicejournal")
+            .1
+            .unwrap()
+            .contains("bejövő"));
     }
 
     #[test]

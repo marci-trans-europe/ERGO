@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import type {
+  AnalysisFyWindow,
   AnalyzeResponse,
   ChatMessage,
   DesktopSettings,
@@ -44,6 +45,18 @@ export const selectAiModel = async (
 ): Promise<DesktopSettings> => {
   ensureDesktop()
   return invoke<DesktopSettings>('select_ai_model', { model })
+}
+
+export const selectAnalysisFyWindow = async (
+  years: AnalysisFyWindow,
+): Promise<DesktopSettings> => {
+  ensureDesktop()
+  return invoke<DesktopSettings>('select_analysis_fy_window', { years })
+}
+
+export const sendFeedback = async (message: string): Promise<void> => {
+  ensureDesktop()
+  await invoke('open_feedback_email', { message })
 }
 
 export const analyzeErp = async (

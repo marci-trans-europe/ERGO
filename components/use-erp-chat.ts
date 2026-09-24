@@ -5,6 +5,7 @@ import {
   KeyboardEvent,
   useCallback,
   useEffect,
+  useRef,
   useState,
 } from 'react'
 
@@ -13,11 +14,17 @@ import {
   checkDatabase,
   listAiModels,
   loadSettings,
+  selectAnalysisFyWindow,
   selectAiModel,
 } from '@/lib/desktop'
-import type { ChatMessage, DesktopSettings } from '@/lib/types'
+import type {
+  AnalysisFyWindow,
+  ChatMessage,
+  DesktopSettings,
+} from '@/lib/types'
 
 const messageId = () => crypto.randomUUID()
+const CONNECTION_CHECK_INTERVAL_MS = 30_000
 
 const errorText = (error: unknown): string => {
   if (typeof error === 'string') return error
@@ -31,6 +38,11 @@ export const useErpChat = () => {
   const [databaseStatus, setDatabaseStatus] = useState<
     'checking' | 'online' | 'offline'
   >('checking')
+  const [lastDatabaseCheckAt, setLastDatabaseCheckAt] = useState<number | null>(
+    null,
+  )
+  const connectionCheckInFlight = useRef(false)
+  const hasCompletedConnectionCheck = useRef(false)
   const [status, setStatus] = useState<'ready' | 'submitted'>('ready')
   const [error, setError] = useState<string | null>(null)
   const [settings, setSettings] = useState<DesktopSettings | null>(null)
@@ -53,13 +65,22 @@ export const useErpChat = () => {
   }, [])
 
   const refreshConnection = useCallback(async () => {
-    setDatabaseStatus('checking')
+    if (connectionCheckInFlight.current) return
+
+    connectionCheckInFlight.current = true
+    if (!hasCompletedConnectionCheck.current) {
+      setDatabaseStatus('checking')
+    }
 
     try {
       await checkDatabase()
       setDatabaseStatus('online')
     } catch {
       setDatabaseStatus('offline')
+    } finally {
+      setLastDatabaseCheckAt(Date.now())
+      hasCompletedConnectionCheck.current = true
+      connectionCheckInFlight.current = false
     }
   }, [])
 
@@ -96,12 +117,7 @@ export const useErpChat = () => {
           return
         }
 
-        try {
-          await checkDatabase()
-          if (active) setDatabaseStatus('online')
-        } catch {
-          if (active) setDatabaseStatus('offline')
-        }
+        await refreshConnection()
       })
       .catch((loadError: unknown) => {
         if (!active) return
@@ -112,7 +128,29 @@ export const useErpChat = () => {
     return () => {
       active = false
     }
-  }, [refreshModels])
+  }, [refreshConnection, refreshModels])
+
+  useEffect(() => {
+    if (!settings?.hasMysqlPassword) return
+
+    const checkWhenVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshConnection()
+      }
+    }
+    const interval = window.setInterval(
+      checkWhenVisible,
+      CONNECTION_CHECK_INTERVAL_MS,
+    )
+    window.addEventListener('focus', checkWhenVisible)
+    document.addEventListener('visibilitychange', checkWhenVisible)
+
+    return () => {
+      window.clearInterval(interval)
+      window.removeEventListener('focus', checkWhenVisible)
+      document.removeEventListener('visibilitychange', checkWhenVisible)
+    }
+  }, [refreshConnection, settings?.hasMysqlPassword])
 
   const changeModel = async (model: string) => {
     if (!settings || model === settings.aiModel || status !== 'ready') return
@@ -127,6 +165,28 @@ export const useErpChat = () => {
     } catch (modelError) {
       setSettings(previous)
       setError(errorText(modelError))
+    }
+  }
+
+  const changeAnalysisFyWindow = async (years: AnalysisFyWindow) => {
+    if (
+      !settings ||
+      years === settings.analysisFyWindow ||
+      status !== 'ready'
+    ) {
+      return
+    }
+
+    const previous = settings
+    setError(null)
+    setSettings({ ...settings, analysisFyWindow: years })
+
+    try {
+      const saved = await selectAnalysisFyWindow(years)
+      setSettings(saved)
+    } catch (windowError) {
+      setSettings(previous)
+      setError(errorText(windowError))
     }
   }
 
@@ -191,12 +251,14 @@ export const useErpChat = () => {
   return {
     clearConversation,
     availableModels,
+    changeAnalysisFyWindow,
     changeModel,
     databaseStatus,
     error,
     handleKeyDown,
     handleSubmit,
     input,
+    lastDatabaseCheckAt,
     messages,
     modelsLoading,
     refreshConnection,

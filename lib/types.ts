@@ -6,6 +6,7 @@ export type QueryValue =
 export type QueryRow = Record<string, QueryValue>
 
 export type QueryVisualization = 'table' | 'bar' | 'line'
+export type AnalysisFyWindow = 1 | 3 | 5
 
 export type QueryResult = {
   kind: 'query-result'
@@ -48,6 +49,7 @@ export type DesktopSettings = {
   mysqlSsl: boolean
   aiBaseUrl: string
   aiModel: string
+  analysisFyWindow: AnalysisFyWindow
   hasMysqlPassword: boolean
   hasAiApiKey: boolean
 }
@@ -69,5 +71,5 @@ export type ChatMessage = {
 
 export type AnalyzeResponse = {
   summary: string
-  result: QueryResult
+  result?: QueryResult
 }

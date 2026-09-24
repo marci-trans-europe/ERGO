@@ -3,6 +3,7 @@
 import {
   ArrowUp,
   BarChart3,
+  CalendarRange,
   Database,
   FileSpreadsheet,
   LoaderCircle,
@@ -14,6 +15,7 @@ import {
 } from 'lucide-react'
 
 import { MessageView } from '@/components/message-view'
+import { FeedbackWidget } from '@/components/feedback-widget'
 import { SettingsDialog } from '@/components/settings-dialog'
 import { useAppUpdater } from '@/components/use-app-updater'
 import { useErpChat } from '@/components/use-erp-chat'
@@ -37,13 +39,36 @@ const quickPrompts = [
 ]
 
 const statusLabels = {
-  checking: 'Kapcsolódás…',
-  online: 'Élő adatkapcsolat',
-  offline: 'Nincs adatkapcsolat',
+  checking: 'Adatbázis ellenőrzése…',
+  online: 'Adatbázis elérhető',
+  offline: 'Adatbázis nem érhető el',
+}
+
+const databaseStatusTitle = (
+  status: keyof typeof statusLabels,
+  checkedAt: number | null,
+) => {
+  const checked = checkedAt
+    ? ` Utolsó ellenőrzés: ${new Date(checkedAt).toLocaleTimeString('hu-HU', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      })}.`
+    : ''
+
+  if (status === 'checking') {
+    return 'Az ERP-adatbázis kapcsolatának ellenőrzése folyamatban van.'
+  }
+  if (status === 'online') {
+    return `Az ERP-adatbázis válaszolt a kapcsolati próbára.${checked}`
+  }
+  return `Az ERP-adatbázis nem válaszolt a kapcsolati próbára.${checked}`
 }
 
 const modelLabels: Record<string, string> = {
   'gpt-6-astra': 'Astra — legerősebb',
+  'gpt-6-sol': 'Sol — ajánlott',
+  'gpt-6-luna': 'Luna — leggazdaságosabb',
   'gpt-5.6-sol': 'Sol — megbízható',
   'gpt-5.6-terra': 'Terra — kiegyensúlyozott',
   'gpt-5.6-luna': 'Luna — gyors',
@@ -56,6 +81,7 @@ export const ChatShell = () => {
   const updater = useAppUpdater()
   const {
     availableModels,
+    changeAnalysisFyWindow,
     changeModel,
     clearConversation,
     databaseStatus,
@@ -63,6 +89,7 @@ export const ChatShell = () => {
     handleKeyDown,
     handleSubmit,
     input,
+    lastDatabaseCheckAt,
     messages,
     modelsLoading,
     refreshSettings,
@@ -159,7 +186,35 @@ export const ChatShell = () => {
                   ))}
                 </select>
               </label>
-              <div className={`database-badge ${databaseStatus}`}>
+              <label className="model-picker period-picker">
+                <CalendarRange aria-hidden="true" size={15} />
+                <span>Időszak</span>
+                <select
+                  aria-label="Elemzési üzleti évek száma"
+                  disabled={isBusy || !settings}
+                  value={settings?.analysisFyWindow ?? 5}
+                  onChange={(event) =>
+                    void changeAnalysisFyWindow(
+                      Number(event.target.value) as 1 | 3 | 5,
+                    )
+                  }
+                >
+                  <option value={1}>1 FY</option>
+                  <option value={3}>3 FY</option>
+                  <option value={5}>5 FY</option>
+                </select>
+              </label>
+              <div
+                aria-label={databaseStatusTitle(
+                  databaseStatus,
+                  lastDatabaseCheckAt,
+                )}
+                className={`database-badge ${databaseStatus}`}
+                title={databaseStatusTitle(
+                  databaseStatus,
+                  lastDatabaseCheckAt,
+                )}
+              >
                 <span className="status-dot" />
                 <Database aria-hidden="true" size={15} />
                 {statusLabels[databaseStatus]}
@@ -248,6 +303,7 @@ export const ChatShell = () => {
           </div>
         </main>
       </div>
+      <FeedbackWidget />
       {settingsOpen ? (
         <SettingsDialog
           onCheckForUpdate={() => updater.checkForUpdate()}

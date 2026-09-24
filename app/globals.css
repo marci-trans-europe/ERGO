@@ -48,6 +48,7 @@ button {
 
 button:focus-visible,
 input:focus-visible,
+select:focus-visible,
 textarea:focus-visible,
 summary:focus-visible {
   outline: 3px solid rgba(217, 103, 63, 0.3);
@@ -464,6 +465,10 @@ button:disabled {
 .model-picker select:disabled {
   cursor: wait;
   opacity: 0.65;
+}
+
+.period-picker select {
+  min-width: 45px;
 }
 
 .database-badge {
@@ -1200,7 +1205,8 @@ button:disabled {
   font-weight: 650;
 }
 
-.settings-grid input:not([type='checkbox']) {
+.settings-grid input:not([type='checkbox']),
+.settings-grid select {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 10px 3px 10px 3px;
@@ -1210,7 +1216,8 @@ button:disabled {
   outline: none;
 }
 
-.settings-grid input:not([type='checkbox']):focus {
+.settings-grid input:not([type='checkbox']):focus,
+.settings-grid select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(217, 103, 63, 0.12);
 }
@@ -1365,6 +1372,142 @@ button:disabled {
   color: white;
 }
 
+/* Feedback */
+.feedback-widget {
+  position: fixed;
+  z-index: 40;
+  right: 22px;
+  bottom: 20px;
+  display: grid;
+  justify-items: end;
+  gap: 10px;
+}
+
+.feedback-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 14px 5px 14px 5px;
+  padding: 11px 14px;
+  background: var(--forest);
+  color: white;
+  cursor: pointer;
+  font-size: 0.74rem;
+  font-weight: 750;
+  box-shadow: 0 12px 36px rgba(16, 40, 36, 0.24);
+}
+
+.feedback-trigger:hover {
+  background: var(--accent);
+}
+
+.feedback-panel {
+  width: min(350px, calc(100vw - 28px));
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 20px 7px 20px 7px;
+  background: var(--card);
+  box-shadow: 0 22px 70px rgba(20, 35, 31, 0.22);
+}
+
+.feedback-panel > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 17px 18px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.feedback-panel h2 {
+  margin: 4px 0 0;
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: 1.2rem;
+  font-weight: 550;
+}
+
+.feedback-panel > header button {
+  display: grid;
+  width: 31px;
+  height: 31px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 9px 3px 9px 3px;
+  background: white;
+  cursor: pointer;
+}
+
+.feedback-conversation {
+  padding: 15px 17px 4px;
+}
+
+.feedback-conversation p {
+  margin: 0;
+  padding: 11px 12px;
+  border-radius: 12px 4px 12px 4px;
+  background: #f0ede6;
+  color: #59645f;
+  font-size: 0.72rem;
+  line-height: 1.55;
+}
+
+.feedback-conversation .feedback-success {
+  margin-top: 9px;
+  background: rgba(40, 168, 120, 0.1);
+  color: #277a5c;
+}
+
+.feedback-panel form {
+  display: grid;
+  gap: 8px;
+  padding: 12px 17px 17px;
+}
+
+.feedback-panel label {
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.feedback-panel textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 12px 4px 12px 4px;
+  padding: 11px 12px;
+  background: white;
+  color: var(--ink);
+  font-size: 0.76rem;
+  line-height: 1.5;
+  outline: 0;
+}
+
+.feedback-panel textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(217, 103, 63, 0.1);
+}
+
+.feedback-panel form > button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 0;
+  border-radius: 11px 4px 11px 4px;
+  padding: 10px 12px;
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-weight: 750;
+}
+
+.feedback-error {
+  margin: 0;
+  color: var(--red);
+  font-size: 0.7rem;
+}
+
 @media (max-width: 900px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -1462,6 +1605,15 @@ button:disabled {
     max-width: 128px;
   }
 
+  .period-picker span,
+  .period-picker svg {
+    display: none;
+  }
+
+  .period-picker select {
+    max-width: 50px;
+  }
+
   .database-badge {
     padding: 8px;
     font-size: 0;
@@ -1504,6 +1656,20 @@ button:disabled {
 
   .composer-hint {
     display: none;
+  }
+
+  .feedback-widget {
+    right: 12px;
+    bottom: 12px;
+  }
+
+  .feedback-trigger span {
+    display: none;
+  }
+
+  .feedback-panel {
+    max-height: calc(100dvh - 90px);
+    overflow-y: auto;
   }
 }
 

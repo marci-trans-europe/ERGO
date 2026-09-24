@@ -25,7 +25,8 @@ const defaults: SettingsInput = {
   mysqlSsl: false,
   mysqlPassword: '',
   aiBaseUrl: 'https://api.openai.com/v1',
-  aiModel: 'gpt-6-astra',
+  aiModel: 'gpt-6-sol',
+  analysisFyWindow: 5,
   aiApiKey: '',
 }
 
@@ -54,6 +55,7 @@ export const SettingsDialog = ({
           mysqlPassword: '',
           aiBaseUrl: settings.aiBaseUrl,
           aiModel: settings.aiModel,
+          analysisFyWindow: settings.analysisFyWindow,
           aiApiKey: '',
         }
       : defaults,
@@ -194,6 +196,22 @@ export const SettingsDialog = ({
                   value={form.aiModel}
                   onChange={(event) => update('aiModel', event.target.value)}
                 />
+              </label>
+              <label>
+                Alapértelmezett időablak
+                <select
+                  value={form.analysisFyWindow}
+                  onChange={(event) =>
+                    update(
+                      'analysisFyWindow',
+                      Number(event.target.value) as 1 | 3 | 5,
+                    )
+                  }
+                >
+                  <option value={1}>1 FY</option>
+                  <option value={3}>3 FY</option>
+                  <option value={5}>5 FY</option>
+                </select>
               </label>
               <label>
                 API-kulcs
