@@ -11,6 +11,7 @@ import {
 
 import {
   analyzeErp,
+  analyzeQuickErp,
   checkDatabase,
   listAiModels,
   loadSettings,
@@ -21,6 +22,7 @@ import type {
   AnalysisFyWindow,
   ChatMessage,
   DesktopSettings,
+  QuickAnalysis,
 } from '@/lib/types'
 
 const messageId = () => crypto.randomUUID()
@@ -190,7 +192,10 @@ export const useErpChat = () => {
     }
   }
 
-  const submitMessage = async (content = input) => {
+  const submitMessage = async (
+    content = input,
+    quickAnalysis?: QuickAnalysis,
+  ) => {
     const trimmedContent = content.trim()
     if (!trimmedContent || status !== 'ready') return
 
@@ -212,7 +217,9 @@ export const useErpChat = () => {
     setStatus('submitted')
 
     try {
-      const response = await analyzeErp(trimmedContent, previousMessages)
+      const response = quickAnalysis
+        ? await analyzeQuickErp(quickAnalysis, trimmedContent)
+        : await analyzeErp(trimmedContent, previousMessages)
       setMessages((current) => [
         ...current,
         {

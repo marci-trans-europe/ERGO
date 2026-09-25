@@ -56,6 +56,15 @@ indításkor is megmarad.
 
 ## Tokenhatékony sémafeldolgozás
 
+Az oldalsáv három gyors elemzése — havi árbevételi trend, top ügyfelek és
+lejárt kintlévőségek — előre ellenőrzött, rögzített SQL-lekérdezést használ.
+Ezeknél nincs AI-alapú SQL-tervezés vagy sémafeltérképezés: csak az eredmény
+szöveges üzleti összefoglalása használ tokent. A szabadon beírt és a
+részletező kérdések továbbra is dinamikus lekérdezést készítenek. A
+kintlévőségi gyorsnézet a nyitott vevői tételt a számlafejhez és a
+számlasorokhoz kapcsolja, ezért számlánként a konkrét cikkeket, mennyiségeket
+és nettó sorértékeket is megmutatja.
+
 Az alkalmazás nem küldi el a teljes adatbázissémát minden kérdéssel. A táblák,
 oszlopok és idegen kulcsok katalógusát 24 órára helyben gyorsítótárazza, majd a
 magyar üzleti kérdés alapján legfeljebb 8 releváns táblát és táblánként 36

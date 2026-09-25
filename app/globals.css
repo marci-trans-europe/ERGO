@@ -885,6 +885,20 @@ button:disabled {
   white-space: nowrap;
 }
 
+.result-card td.item-breakdown-cell {
+  min-width: 320px;
+  max-width: 480px;
+  white-space: normal;
+}
+
+.item-breakdown {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 17px;
+  line-height: 1.4;
+}
+
 .result-card tbody tr:nth-child(even) {
   background: #faf9f5;
 }
@@ -961,7 +975,43 @@ button:disabled {
 }
 
 .result-chart {
+  position: relative;
+  overflow-x: auto;
   padding: 18px 18px 10px;
+}
+
+.chart-hover-value {
+  position: absolute;
+  z-index: 2;
+  top: 8px;
+  left: 50%;
+  display: flex;
+  width: max-content;
+  min-height: 28px;
+  max-width: min(420px, 80vw);
+  align-items: center;
+  gap: 8px;
+  margin: 0 auto 4px;
+  padding: 5px 10px;
+  transform: translateX(-50%);
+  border: 1px solid #d9ddd7;
+  border-radius: 8px 3px 8px 3px;
+  background: #fffefa;
+  color: #39433f;
+  font-size: 0.68rem;
+  white-space: nowrap;
+  box-shadow: 0 5px 18px rgba(34, 47, 43, 0.1);
+}
+
+.chart-hover-value strong {
+  overflow: hidden;
+  max-width: 290px;
+  text-overflow: ellipsis;
+}
+
+.chart-hover-value span:last-child {
+  color: var(--accent);
+  font-weight: 750;
 }
 
 .result-chart svg {

@@ -22,16 +22,19 @@ import { useErpChat } from '@/components/use-erp-chat'
 
 const quickPrompts = [
   {
+    id: 'revenue-trend' as const,
     icon: TrendingUp,
     label: 'Árbevétel trendje',
     prompt: 'Mutasd meg az elmúlt 12 hónap árbevételének havi trendjét.',
   },
   {
+    id: 'top-customers' as const,
     icon: BarChart3,
     label: 'Top ügyfelek',
     prompt: 'Melyik 10 ügyfél hozta a legtöbb árbevételt idén?',
   },
   {
+    id: 'overdue-receivables' as const,
     icon: FileSpreadsheet,
     label: 'Kintlévőségek',
     prompt: 'Készíts összefoglalót a jelenlegi lejárt kintlévőségekről.',
@@ -125,11 +128,11 @@ export const ChatShell = () => {
 
           <nav className="prompt-nav" aria-label="Gyors kérdések">
             <p className="nav-label">GYORS KÉRDÉSEK</p>
-            {quickPrompts.map(({ icon: Icon, label, prompt }) => (
+            {quickPrompts.map(({ icon: Icon, id, label, prompt }) => (
               <button
                 disabled={isBusy}
                 key={label}
-                onClick={() => void submitMessage(prompt)}
+                onClick={() => void submitMessage(prompt, id)}
                 type="button"
               >
                 <Icon aria-hidden="true" size={16} />
@@ -210,10 +213,7 @@ export const ChatShell = () => {
                   lastDatabaseCheckAt,
                 )}
                 className={`database-badge ${databaseStatus}`}
-                title={databaseStatusTitle(
-                  databaseStatus,
-                  lastDatabaseCheckAt,
-                )}
+                title={databaseStatusTitle(databaseStatus, lastDatabaseCheckAt)}
               >
                 <span className="status-dot" />
                 <Database aria-hidden="true" size={15} />
@@ -236,11 +236,11 @@ export const ChatShell = () => {
                   összefoglalja.
                 </p>
                 <div className="suggestion-grid">
-                  {quickPrompts.map(({ icon: Icon, label, prompt }) => (
+                  {quickPrompts.map(({ icon: Icon, id, label, prompt }) => (
                     <button
                       disabled={isBusy}
                       key={label}
-                      onClick={() => void submitMessage(prompt)}
+                      onClick={() => void submitMessage(prompt, id)}
                       type="button"
                     >
                       <Icon aria-hidden="true" size={19} />

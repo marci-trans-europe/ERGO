@@ -5,6 +5,7 @@ import type {
   AnalyzeResponse,
   ChatMessage,
   DesktopSettings,
+  QuickAnalysis,
   SettingsInput,
 } from '@/lib/types'
 
@@ -66,6 +67,22 @@ export const analyzeErp = async (
   ensureDesktop()
   return invoke<AnalyzeResponse>('analyze_erp', {
     question,
-    history: messages.slice(-8).map(({ content, role }) => ({ content, role })),
+    history: messages.slice(-8).map(({ content, result, role }) => ({
+      content: result
+        ? `${content}\n\nKorábbi lekérdezés címe: ${result.title}\nKorábbi SQL: ${result.sql}\nKorábbi eredmény mintája: ${JSON.stringify(result.rows.slice(0, 12))}`
+        : content,
+      role,
+    })),
+  })
+}
+
+export const analyzeQuickErp = async (
+  quickAnalysis: QuickAnalysis,
+  question: string,
+): Promise<AnalyzeResponse> => {
+  ensureDesktop()
+  return invoke<AnalyzeResponse>('analyze_quick_erp', {
+    quickAnalysis,
+    question,
   })
 }

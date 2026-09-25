@@ -116,6 +116,7 @@ struct QueryResult {
     row_count: usize,
     truncated: bool,
     sql: String,
+    query_source: &'static str,
     token_usage: TokenUsage,
     schema_selection: SchemaSelectionStats,
 }
@@ -159,6 +160,38 @@ struct SchemaSelectionStats {
 struct AiCallResult {
     content: String,
     usage: TokenUsage,
+}
+
+fn fixed_quick_plan(quick_analysis: &str, analysis_fy_window: u8) -> Result<QueryPlan, String> {
+    let fiscal_year_start = format!(
+        "MAKEDATE(YEAR(CURRENT_DATE) - {}, 1)",
+        analysis_fy_window - 1
+    );
+    match quick_analysis {
+        "revenue-trend" => Ok(QueryPlan {
+            sql: format!(
+                "SELECT DATE_FORMAT(STR_TO_DATE(il.invoicedate, '%Y.%m.%d'), '%Y-%m') AS honap, ROUND(SUM(il.vatbase), 2) AS arbevetel FROM invoiceline AS il WHERE STR_TO_DATE(il.invoicedate, '%Y.%m.%d') >= GREATEST(DATE_SUB(CURRENT_DATE, INTERVAL 12 MONTH), {fiscal_year_start}) AND STR_TO_DATE(il.invoicedate, '%Y.%m.%d') <= CURRENT_DATE GROUP BY DATE_FORMAT(STR_TO_DATE(il.invoicedate, '%Y.%m.%d'), '%Y-%m') ORDER BY honap ASC"
+            ),
+            title: "Havi árbevételi trend".into(),
+            visualization: "line".into(),
+            max_rows: 50,
+        }),
+        "top-customers" => Ok(QueryPlan {
+            sql: "SELECT il.customernumber AS ugyfelszam, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', c.name1, c.name2, c.name3, c.name4, c.name5)), ''), il.customernumber) AS ugyfel, ROUND(SUM(il.vatbase), 2) AS arbevetel FROM invoiceline AS il LEFT JOIN customer AS c ON c.customernumber = il.customernumber WHERE STR_TO_DATE(il.invoicedate, '%Y.%m.%d') >= MAKEDATE(YEAR(CURRENT_DATE), 1) AND STR_TO_DATE(il.invoicedate, '%Y.%m.%d') <= CURRENT_DATE GROUP BY il.customernumber, c.name1, c.name2, c.name3, c.name4, c.name5 ORDER BY arbevetel DESC LIMIT 10".into(),
+            title: "Top 10 ügyfél idei árbevétel szerint".into(),
+            visualization: "bar".into(),
+            max_rows: 10,
+        }),
+        "overdue-receivables" => Ok(QueryPlan {
+            sql: format!(
+                "SELECT ce.customernumber AS ugyfelszam, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', c.name1, c.name2, c.name3, c.name4, c.name5)), ''), ce.customernumber) AS ugyfel, ce.transactionnumber AS szamlaszam, DATE_FORMAT(STR_TO_DATE(ce.invoicedate, '%Y.%m.%d'), '%Y-%m-%d') AS szamla_datum, DATE_FORMAT(STR_TO_DATE(ce.duedate, '%Y.%m.%d'), '%Y-%m-%d') AS esedekesseg, DATEDIFF(CURRENT_DATE, STR_TO_DATE(ce.duedate, '%Y.%m.%d')) AS kesedelmes_napok, ROUND(COALESCE(i.totalstandard, ce.debitstandard - ce.creditstandard), 2) AS szamla_osszeg, ROUND(ce.remainderstandard, 2) AS kintlevoseg, COALESCE(i.standardcurrency, ce.originalcurrency) AS penznemkod, COUNT(il.linenumber) AS cikksorok_szama, GROUP_CONCAT(CASE WHEN il.linenumber IS NULL THEN 'Nincs kapcsolt számlasor' ELSE CONCAT_WS(' · ', COALESCE(NULLIF(il.itemnumber, ''), 'cikkszám nélkül'), COALESCE(NULLIF(il.itemtext1, ''), NULLIF(il.externalitemtext, ''), 'megnevezés nélkül'), CONCAT('menny.: ', COALESCE(il.numberinvoiced, 0)), CONCAT('nettó: ', COALESCE(il.vatbase, 0))) END ORDER BY il.linenumber SEPARATOR ' | ') AS cikkek FROM customerentry AS ce LEFT JOIN invoice AS i ON i.invoicenumber = ce.transactionnumber AND i.customernumber = ce.customernumber AND i.companynumber = ce.companynumber LEFT JOIN invoiceline AS il ON il.invoicenumber = i.invoicenumber AND il.companynumber = i.companynumber LEFT JOIN customer AS c ON c.customernumber = ce.customernumber WHERE STR_TO_DATE(ce.duedate, '%Y.%m.%d') < CURRENT_DATE AND STR_TO_DATE(ce.postingdate, '%Y.%m.%d') >= {fiscal_year_start} AND STR_TO_DATE(ce.postingdate, '%Y.%m.%d') <= CURRENT_DATE AND ce.remainderstandard > 0 GROUP BY ce.customernumber, c.name1, c.name2, c.name3, c.name4, c.name5, ce.transactionnumber, ce.invoicedate, ce.duedate, i.totalstandard, ce.debitstandard, ce.creditstandard, ce.remainderstandard, i.standardcurrency, ce.originalcurrency ORDER BY kintlevoseg DESC LIMIT 50"
+            ),
+            title: "Lejárt kintlévőségek számlánként és cikksoronként".into(),
+            visualization: "table".into(),
+            max_rows: 50,
+        }),
+        _ => Err("Ismeretlen gyors elemzés.".into()),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1403,6 +1436,94 @@ async fn call_ai(
     Ok(AiCallResult { content, usage })
 }
 
+async fn summarize_query_result(
+    settings: &StoredSettings,
+    api_key: &str,
+    question: &str,
+    rows: &[JsonValue],
+    truncated: bool,
+    analysis_fy_window: u8,
+) -> Result<AiCallResult, String> {
+    let preview_rows = rows.iter().take(SUMMARY_PREVIEW_ROWS).collect::<Vec<_>>();
+    let full_preview = serde_json::to_string(&preview_rows)
+        .map_err(|error| format!("Az eredmény nem alakítható át: {error}"))?;
+    let result_preview = full_preview
+        .chars()
+        .take(SUMMARY_PREVIEW_CHARACTERS)
+        .collect::<String>();
+    let summary_system = r#"Te az ERGO, a Trans-Europe üzleti adatelemzője vagy.
+Magyarul válaszolj. Kezdd a legfontosabb üzleti következtetéssel, majd támaszd alá a kapott számokkal.
+Ne találj ki adatot, pénznemet, mértékegységet vagy üzleti definíciót. Ha az eredmény üres vagy kétértelmű, ezt mondd ki.
+Minden pénzösszeget magyar formátumban, hármas számjegycsoportokkal és legfeljebb két tizedessel írj, például: 24 752 384,12.
+Legyél tömör és gyakorlatias, legfeljebb 180 szóban. Jelezd, ha a látható eredmény korlátozott. Markdown használható."#;
+    let summary_user = format!(
+        "Eredeti kérdés: {question}\nBeállított elemzési időablak: {analysis_fy_window} FY.\n\nLekérdezési eredmény első {} sora (JSON, legfeljebb {} karakter):\n{}\n\nTeljes visszaadott sorszám: {}\nAdatbázis-lekérdezés csonkolt: {}",
+        SUMMARY_PREVIEW_ROWS,
+        SUMMARY_PREVIEW_CHARACTERS,
+        result_preview,
+        rows.len(),
+        truncated
+    );
+    call_ai(settings, api_key, summary_system, &summary_user, false).await
+}
+
+#[tauri::command]
+async fn analyze_quick_erp(
+    app: AppHandle,
+    quick_analysis: String,
+    question: String,
+) -> Result<AnalyzeResponse, String> {
+    if question.trim().is_empty() {
+        return Err("A kérdés nem lehet üres.".into());
+    }
+    let settings = read_settings(&app)?;
+    let analysis_fy_window = validate_analysis_fy_window(settings.analysis_fy_window)?;
+    let plan = fixed_quick_plan(&quick_analysis, analysis_fy_window)?;
+    let sql = assert_read_only_sql(&plan.sql)?;
+    let mysql_password = read_secret(
+        &app,
+        "MYSQL_PASSWORD",
+        MYSQL_PASSWORD_ACCOUNT,
+        "MySQL-jelszó",
+    )?;
+    let api_key = read_secret(&app, "AI_API_KEY", AI_API_KEY_ACCOUNT, "AI API-kulcs")?;
+    let (columns, rows, truncated) =
+        run_query(&settings, mysql_password, &sql, plan.max_rows).await?;
+    let summary_call = summarize_query_result(
+        &settings,
+        &api_key,
+        question.trim(),
+        &rows,
+        truncated,
+        analysis_fy_window,
+    )
+    .await?;
+    let row_count = rows.len();
+
+    Ok(AnalyzeResponse {
+        summary: summary_call.content,
+        result: Some(QueryResult {
+            kind: "query-result",
+            title: plan.title,
+            visualization: plan.visualization,
+            columns,
+            rows,
+            row_count,
+            truncated,
+            sql,
+            query_source: "fixed",
+            token_usage: summary_call.usage,
+            schema_selection: SchemaSelectionStats {
+                total_tables: 0,
+                total_columns: 0,
+                selected_tables: 0,
+                selected_columns: 0,
+                context_characters: 0,
+            },
+        }),
+    })
+}
+
 #[tauri::command]
 async fn analyze_erp(
     app: AppHandle,
@@ -1439,7 +1560,7 @@ async fn analyze_erp(
     let history_text = relevant_history
         .into_iter()
         .map(|message| {
-            let compact_content = message.content.chars().take(700).collect::<String>();
+            let compact_content = message.content.chars().take(3_500).collect::<String>();
             format!("{}: {compact_content}", message.role)
         })
         .collect::<Vec<_>>()
@@ -1512,27 +1633,15 @@ Javítsd ki a tervet. A JSON sql mezője pontosan egyetlen, záró pontosvessző
 
     let (columns, rows, truncated) =
         run_query(&settings, mysql_password, &plan.sql, plan.max_rows).await?;
-    let preview_rows = rows.iter().take(SUMMARY_PREVIEW_ROWS).collect::<Vec<_>>();
-    let full_preview = serde_json::to_string(&preview_rows)
-        .map_err(|error| format!("Az eredmény nem alakítható át: {error}"))?;
-    let result_preview = full_preview
-        .chars()
-        .take(SUMMARY_PREVIEW_CHARACTERS)
-        .collect::<String>();
-    let summary_system = r#"Te az ERGO, a Trans-Europe üzleti adatelemzője vagy.
-Magyarul válaszolj. Kezdd a legfontosabb üzleti következtetéssel, majd támaszd alá a kapott számokkal.
-Ne találj ki adatot, pénznemet, mértékegységet vagy üzleti definíciót. Ha az eredmény üres vagy kétértelmű, ezt mondd ki.
-Legyél tömör és gyakorlatias, legfeljebb 180 szóban. Jelezd, ha a látható eredmény korlátozott. Markdown használható."#;
-    let summary_user = format!(
-        "Eredeti kérdés: {}\n\nLekérdezési eredmény első {} sora (JSON, legfeljebb {} karakter):\n{}\n\nTeljes visszaadott sorszám: {}\nAdatbázis-lekérdezés csonkolt: {}",
+    let summary_call = summarize_query_result(
+        &settings,
+        &api_key,
         question.trim(),
-        SUMMARY_PREVIEW_ROWS,
-        SUMMARY_PREVIEW_CHARACTERS,
-        result_preview,
-        rows.len(),
-        truncated
-    );
-    let summary_call = call_ai(&settings, &api_key, summary_system, &summary_user, false).await?;
+        &rows,
+        truncated,
+        analysis_fy_window,
+    )
+    .await?;
     let mut token_usage = planner_usage;
     token_usage.add(&summary_call.usage);
     let row_count = rows.len();
@@ -1548,6 +1657,7 @@ Legyél tömör és gyakorlatias, legfeljebb 180 szóban. Jelezd, ha a látható
             row_count,
             truncated,
             sql: plan.sql,
+            query_source: "generated",
             token_usage,
             schema_selection,
         }),
@@ -1560,6 +1670,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             analyze_erp,
+            analyze_quick_erp,
             check_database,
             list_ai_models,
             load_settings,
@@ -1575,10 +1686,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_read_only_sql, capability_answer, extract_json, is_chat_model,
-        percent_encode_mailto, responses_input, schema_search_terms, select_schema_context,
-        table_business_metadata, validate_analysis_fy_window, validate_model, CatalogColumn,
-        QueryPlan, SchemaCatalog, SchemaTable,
+        assert_read_only_sql, capability_answer, extract_json, fixed_quick_plan, is_chat_model,
+        percent_encode_mailto, responses_input, run_query, schema_search_terms,
+        select_schema_context, table_business_metadata, validate_analysis_fy_window,
+        validate_model, CatalogColumn, QueryPlan, SchemaCatalog, SchemaTable, StoredSettings,
     };
 
     #[test]
@@ -1634,6 +1745,45 @@ mod tests {
         assert_eq!(validate_analysis_fy_window(3).unwrap(), 3);
         assert_eq!(validate_analysis_fy_window(5).unwrap(), 5);
         assert!(validate_analysis_fy_window(2).is_err());
+    }
+
+    #[test]
+    fn fixed_quick_queries_are_single_read_only_statements() {
+        for quick_analysis in ["revenue-trend", "top-customers", "overdue-receivables"] {
+            let plan = fixed_quick_plan(quick_analysis, 3).unwrap();
+            assert_read_only_sql(&plan.sql).unwrap();
+        }
+        assert!(fixed_quick_plan("unknown", 3).is_err());
+    }
+
+    #[test]
+    #[ignore = "VPN-t és helyi .env fájlt igényel"]
+    fn live_fixed_quick_queries_return_rows() {
+        let env_path = std::env::var("ERGO_ENV_PATH").expect("ERGO_ENV_PATH is required");
+        let contents = std::fs::read_to_string(env_path).expect("the .env file must be readable");
+        let password = contents
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("MYSQL_PASSWORD="))
+            .map(|value| value.trim().trim_matches(['\'', '"']).to_string())
+            .filter(|value| !value.is_empty())
+            .expect("MYSQL_PASSWORD must be present");
+
+        tauri::async_runtime::block_on(async {
+            let settings = StoredSettings::default();
+            for quick_analysis in ["revenue-trend", "top-customers", "overdue-receivables"] {
+                let plan = fixed_quick_plan(quick_analysis, 1).unwrap();
+                let (_, rows, _) = run_query(&settings, password.clone(), &plan.sql, plan.max_rows)
+                    .await
+                    .unwrap_or_else(|error| panic!("{quick_analysis} failed: {error}"));
+                assert!(!rows.is_empty(), "{quick_analysis} returned no rows");
+                if quick_analysis == "overdue-receivables" {
+                    let first = rows[0].as_object().expect("row must be an object");
+                    assert!(first.contains_key("szamlaszam"));
+                    assert!(first.contains_key("cikksorok_szama"));
+                    assert!(first.contains_key("cikkek"));
+                }
+            }
+        });
     }
 
     #[test]

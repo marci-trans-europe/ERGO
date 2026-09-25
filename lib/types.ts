@@ -7,6 +7,8 @@ export type QueryRow = Record<string, QueryValue>
 
 export type QueryVisualization = 'table' | 'bar' | 'line'
 export type AnalysisFyWindow = 1 | 3 | 5
+export type QuickAnalysis =
+  'revenue-trend' | 'top-customers' | 'overdue-receivables'
 
 export type QueryResult = {
   kind: 'query-result'
@@ -17,6 +19,7 @@ export type QueryResult = {
   rowCount: number
   truncated: boolean
   sql: string
+  querySource: 'generated' | 'fixed'
   tokenUsage: {
     inputTokens: number
     outputTokens: number

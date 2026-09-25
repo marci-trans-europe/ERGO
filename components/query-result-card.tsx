@@ -1,6 +1,7 @@
 'use client'
 
 import { Braces, Download, Table2 } from 'lucide-react'
+import { useState } from 'react'
 
 import type { QueryResult, QueryRow, QueryValue } from '@/lib/types'
 
@@ -8,19 +9,72 @@ type QueryResultCardProps = {
   result: QueryResult
 }
 
-const displayValue = (value: QueryValue | undefined): string => {
+const amountColumnTerms = [
+  'amount',
+  'arbevetel',
+  'árbevétel',
+  'credit',
+  'debit',
+  'ertek',
+  'érték',
+  'itemsum',
+  'kintlevoseg',
+  'kintlévőség',
+  'koltseg',
+  'költség',
+  'lineprice',
+  'netto',
+  'nettó',
+  'osszeg',
+  'összeg',
+  'price',
+  'remainder',
+  'total',
+  'vatbase',
+  'vatcurrency',
+]
+
+const amountFormatter = new Intl.NumberFormat('hu-HU', {
+  maximumFractionDigits: 2,
+})
+
+const isAmountColumn = (column?: string) => {
+  const normalized = column?.toLocaleLowerCase('hu-HU') ?? ''
+  return amountColumnTerms.some((term) => normalized.includes(term))
+}
+
+const formatEmbeddedAmounts = (value: string) =>
+  value.replace(
+    /(nettó:\s*)(-?\d+(?:\.\d+)?)/giu,
+    (_, label, amount) => `${label}${amountFormatter.format(Number(amount))}`,
+  )
+
+const displayValue = (
+  value: QueryValue | undefined,
+  column?: string,
+): string => {
   if (value === null || value === undefined) return '—'
   if (typeof value === 'object') return JSON.stringify(value)
   if (typeof value === 'number') {
-    return new Intl.NumberFormat('hu-HU', { maximumFractionDigits: 2 }).format(
-      value,
-    )
+    return amountFormatter.format(value)
+  }
+  if (
+    isAmountColumn(column) &&
+    typeof value === 'string' &&
+    /^-?\d+(?:\.\d+)?$/.test(value)
+  ) {
+    return amountFormatter.format(Number(value))
   }
   return String(value)
 }
 
 const escapeCsv = (value: QueryValue | undefined): string => {
-  const text = displayValue(value)
+  const text =
+    value === null || value === undefined
+      ? ''
+      : typeof value === 'object'
+        ? JSON.stringify(value)
+        : String(value)
   return `"${text.replaceAll('"', '""')}"`
 }
 
@@ -43,17 +97,41 @@ const downloadCsv = (result: QueryResult) => {
 }
 
 const findChartColumns = (result: QueryResult) => {
-  const labelColumn = result.columns[0]
-  const valueColumn = result.columns
-    .slice(1)
-    .find((column) =>
-      result.rows.some((row) => Number.isFinite(Number(row[column]))),
-    )
+  const numericColumns = result.columns.filter((column) =>
+    result.rows.some((row) => Number.isFinite(Number(row[column]))),
+  )
+  const valueColumn =
+    numericColumns.find((column) => isAmountColumn(column)) ?? numericColumns[0]
+  const preferredLabels = [
+    'ugyfel',
+    'ügyfél',
+    'customer_name',
+    'customername',
+    'name',
+    'honap',
+    'hónap',
+    'month',
+    'datum',
+    'dátum',
+    'date',
+    'label',
+  ]
+  const labelColumn =
+    result.columns.find((column) =>
+      preferredLabels.includes(column.toLocaleLowerCase('hu-HU')),
+    ) ??
+    result.columns
+      .filter((column) => column !== valueColumn)
+      .find((column) =>
+        result.rows.some((row) => !Number.isFinite(Number(row[column]))),
+      ) ??
+    result.columns[0]
 
   return labelColumn && valueColumn ? { labelColumn, valueColumn } : null
 }
 
 const ResultChart = ({ result }: QueryResultCardProps) => {
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null)
   const columns = findChartColumns(result)
   if (!columns) return null
 
@@ -67,9 +145,15 @@ const ResultChart = ({ result }: QueryResultCardProps) => {
 
   if (points.length < 2) return null
 
-  const width = 760
-  const height = 280
-  const padding = { top: 24, right: 24, bottom: 54, left: 58 }
+  const isBarChart = result.visualization === 'bar'
+  const width = Math.max(760, points.length * (isBarChart ? 88 : 72))
+  const height = isBarChart ? 330 : 290
+  const padding = {
+    top: 24,
+    right: 24,
+    bottom: isBarChart ? 100 : 64,
+    left: 58,
+  }
   const chartWidth = width - padding.left - padding.right
   const chartHeight = height - padding.top - padding.bottom
   const minValue = Math.min(0, ...points.map((point) => point.value))
@@ -79,14 +163,27 @@ const ResultChart = ({ result }: QueryResultCardProps) => {
     padding.top + ((maxValue - value) / range) * chartHeight
   const x = (index: number) =>
     padding.left + (index / Math.max(points.length - 1, 1)) * chartWidth
+  const pointX = (index: number) =>
+    isBarChart
+      ? padding.left + ((index + 0.5) / points.length) * chartWidth
+      : x(index)
   const baseline = y(0)
-  const labelEvery = Math.max(1, Math.ceil(points.length / 7))
+  const hoveredPoint = hoveredIndex === null ? null : points[hoveredIndex]
 
   return (
     <div className="result-chart">
+      {hoveredPoint ? (
+        <div aria-live="polite" className="chart-hover-value">
+          <>
+            <strong>{hoveredPoint.label}</strong>
+            <span>{displayValue(hoveredPoint.value, columns.valueColumn)}</span>
+          </>
+        </div>
+      ) : null}
       <svg
         aria-label={result.title}
         role="img"
+        style={{ minWidth: width }}
         viewBox={`0 0 ${width} ${height}`}
       >
         <line
@@ -130,24 +227,30 @@ const ResultChart = ({ result }: QueryResultCardProps) => {
           )}
         </text>
 
-        {result.visualization === 'bar' ? (
+        {isBarChart ? (
           points.map((point, index) => {
             const gap = Math.max(3, (chartWidth / points.length) * 0.18)
             const barWidth = Math.max(4, chartWidth / points.length - gap)
             const pointY = y(point.value)
             return (
               <rect
+                aria-label={`${point.label}: ${displayValue(point.value, columns.valueColumn)}`}
                 className="chart-bar"
                 height={Math.abs(baseline - pointY)}
                 key={`${point.label}-${index}`}
+                onBlur={() => setHoveredIndex(null)}
+                onFocus={() => setHoveredIndex(index)}
+                onMouseEnter={() => setHoveredIndex(index)}
+                onMouseLeave={() => setHoveredIndex(null)}
                 rx={Math.min(5, barWidth / 3)}
+                tabIndex={0}
                 width={barWidth}
                 x={
                   padding.left + (index / points.length) * chartWidth + gap / 2
                 }
                 y={Math.min(pointY, baseline)}
               >
-                <title>{`${point.label}: ${displayValue(point.value)}`}</title>
+                <title>{`${point.label}: ${displayValue(point.value, columns.valueColumn)}`}</title>
               </rect>
             )
           })
@@ -161,37 +264,43 @@ const ResultChart = ({ result }: QueryResultCardProps) => {
             />
             {points.map((point, index) => (
               <circle
+                aria-label={`${point.label}: ${displayValue(point.value, columns.valueColumn)}`}
                 className="chart-point"
                 cx={x(index)}
                 cy={y(point.value)}
                 key={`${point.label}-${index}`}
-                r="4"
+                onBlur={() => setHoveredIndex(null)}
+                onFocus={() => setHoveredIndex(index)}
+                onMouseEnter={() => setHoveredIndex(index)}
+                onMouseLeave={() => setHoveredIndex(null)}
+                r="6"
+                tabIndex={0}
               >
-                <title>{`${point.label}: ${displayValue(point.value)}`}</title>
+                <title>{`${point.label}: ${displayValue(point.value, columns.valueColumn)}`}</title>
               </circle>
             ))}
           </>
         )}
 
-        {points.map((point, index) =>
-          index % labelEvery === 0 || index === points.length - 1 ? (
-            <text
-              className="chart-x-label"
-              key={`${point.label}-label`}
-              textAnchor="middle"
-              x={
-                result.visualization === 'bar'
-                  ? padding.left + ((index + 0.5) / points.length) * chartWidth
-                  : x(index)
-              }
-              y={height - 20}
-            >
-              {point.label.length > 14
-                ? `${point.label.slice(0, 12)}…`
-                : point.label}
-            </text>
-          ) : null,
-        )}
+        {points.map((point, index) => (
+          <text
+            className="chart-x-label"
+            key={`${point.label}-label`}
+            textAnchor={isBarChart ? 'end' : 'middle'}
+            transform={
+              isBarChart
+                ? `rotate(-32 ${pointX(index)} ${height - 22})`
+                : undefined
+            }
+            x={pointX(index)}
+            y={height - 22}
+          >
+            <title>{point.label}</title>
+            {point.label.length > 20
+              ? `${point.label.slice(0, 18)}…`
+              : point.label}
+          </text>
+        ))}
       </svg>
       <div className="chart-legend">
         <span />
@@ -221,7 +330,24 @@ const ResultTable = ({
         {rows.map((row, rowIndex) => (
           <tr key={rowIndex}>
             {columns.map((column) => (
-              <td key={column}>{displayValue(row[column])}</td>
+              <td
+                className={
+                  column === 'cikkek' ? 'item-breakdown-cell' : undefined
+                }
+                key={column}
+              >
+                {column === 'cikkek' && typeof row[column] === 'string' ? (
+                  <ul className="item-breakdown">
+                    {row[column].split(' | ').map((item, itemIndex) => (
+                      <li key={`${item}-${itemIndex}`}>
+                        {formatEmbeddedAmounts(item)}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  displayValue(row[column], column)
+                )}
+              </td>
             ))}
           </tr>
         ))}
@@ -274,12 +400,16 @@ export const QueryResultCard = ({ result }: QueryResultCardProps) => {
           ) : (
             <span>Teljes lekérdezési eredmény</span>
           )}
-          <span>
-            Séma: {result.schemaSelection.selectedTables}/
-            {result.schemaSelection.totalTables} tábla ·{' '}
-            {result.schemaSelection.selectedColumns}/
-            {result.schemaSelection.totalColumns} oszlop
-          </span>
+          {result.querySource === 'fixed' ? (
+            <span>Fix, ellenőrzött SQL · AI-tervezés nélkül</span>
+          ) : (
+            <span>
+              Séma: {result.schemaSelection.selectedTables}/
+              {result.schemaSelection.totalTables} tábla ·{' '}
+              {result.schemaSelection.selectedColumns}/
+              {result.schemaSelection.totalColumns} oszlop
+            </span>
+          )}
           <span>
             Token: {result.tokenUsage.inputTokens} be ·{' '}
             {result.tokenUsage.outputTokens} ki
