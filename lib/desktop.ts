@@ -2,9 +2,11 @@ import { invoke } from '@tauri-apps/api/core'
 
 import type {
   AnalysisFyWindow,
+  AnalysisFeedbackInput,
   AnalyzeResponse,
   ChatMessage,
   DesktopSettings,
+  KnowledgeOverview,
   QuickAnalysis,
   SettingsInput,
 } from '@/lib/types'
@@ -58,6 +60,25 @@ export const selectAnalysisFyWindow = async (
 export const sendFeedback = async (message: string): Promise<void> => {
   ensureDesktop()
   await invoke('open_feedback_email', { message })
+}
+
+export const saveAnalysisFeedback = async (
+  feedback: AnalysisFeedbackInput,
+): Promise<string> => {
+  ensureDesktop()
+  return invoke<string>('save_analysis_feedback', { feedback })
+}
+
+export const loadKnowledgeOverview = async (): Promise<KnowledgeOverview> => {
+  ensureDesktop()
+  return invoke<KnowledgeOverview>('load_knowledge_overview')
+}
+
+export const emailAnalysisFeedback = async (
+  feedbackId: string,
+): Promise<void> => {
+  ensureDesktop()
+  await invoke('open_analysis_feedback_email', { feedbackId })
 }
 
 export const analyzeErp = async (

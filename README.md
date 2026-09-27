@@ -81,14 +81,46 @@ kérdésnél csak a szöveges összefoglaló használ AI-tokeneket.
 Az „X végfelhasználó mit vásárolt?” megfogalmazást az ERGO általánosan
 felismeri: az `endcustomer` törzsben helyben feloldja a szervezet nevét és
 aliasait — többek között a „szoft” és „soft” írásváltozatokat —, majd ugyanazt
-az ellenőrzött számla–cikksor relációt használja. A hosszú lekérdezési
-eredmények tördelhető táblázatban jelennek meg, és egy gombbal teljes képernyős
-nézetre válthatók.
+az ellenőrzött számla–cikksor relációt használja. A feloldás teljes névelemeket
+vizsgál, így például az AERON nem egyezik az AERONAUTICA szórészletre, a közös
+névelemmel rendelkező vállalatcsoportok — például a MÁV-változatok — viszont
+együtt maradnak. A „top N végfelhasználó” kérdések szintén fix, AI-tervezés
+nélküli SQL-lekérdezést használnak, és nettó alapdevizás számlasorérték alapján
+rangsorolnak. A hosszú lekérdezési eredmények tördelhető táblázatban jelennek
+meg, és egy gombbal teljes képernyős nézetre válthatók.
 
 Az alkalmazás nem küldi el a teljes adatbázissémát minden kérdéssel. A táblák,
 oszlopok és idegen kulcsok katalógusát 24 órára helyben gyorsítótárazza, majd a
 magyar üzleti kérdés alapján legfeljebb 8 releváns táblát és táblánként 36
 fontos oszlopot választ ki. A séma teljes tartalma nem kerül a GitHubra.
+
+## ERGO Knowledge Pack és használat közbeni fejlesztés
+
+Az üzleti definíciók, ellenőrzött táblakapcsolatok, entitásaliasok és ismert
+elemzési skillek verziózott, helyi Knowledge Packben találhatók. A csomag az
+alkalmazás része, nem tartalmaz jelszót vagy tranzakciós adatot. Az AI-val
+tervezett lekérdezések csak a kérdéshez szükséges sémarészlet mellett ezt a
+kuratált tudást kapják meg; a gyakori skillek továbbra is fix SQL-t használnak.
+
+Minden elemzői válasz alatt külön jelölhető, hogy helyes volt-e. A javítandó
+válaszhoz kategória és szöveges korrekció adható. Az ERGO helyben, az
+alkalmazástámogatási mappában lévő `analysis-feedback.json` fájlba menti:
+
+- az eredeti kérdést és az ERGO összefoglalóját;
+- a kiválasztott kategóriát és a felhasználó korrekcióját;
+- az eredmény címét, sorainak számát, a lekérdezés forrását és SQL-jét;
+- az alkalmazás, a modell és az elemzési időablak verzióadatait.
+
+A visszajelzés nem tartalmaz API-kulcsot, adatbázis-jelszót vagy nyers
+lekérdezési sorokat, és a mentése nem használ AI-tokeneket. A beállítások
+„Tudás és javítások” része mutatja a tudáscsomag állapotát és a fejlesztésre
+váró korrekciókat. Ezekből előkészíthető egy e-mailes fejlesztési csomag, de a
+visszajelzés biztonsági okból soha nem módosít automatikusan SQL-t vagy üzleti
+szabályt. A jóváhagyott javítás a következő Knowledge Pack-verzióval és
+regressziós teszttel kerül az alkalmazásba.
+
+Az OpenAI Responses API lekérdezési tervei szigorú JSON-sémát használnak, így
+az ERGO csak a várt SQL-, cím-, vizualizáció- és sorszámmezőket fogadja el.
 
 Az eredménykártya megmutatja a kiválasztott és teljes séma méretét, valamint az
 OpenAI által visszaadott input-, output- és cache-tokenek számát. A második,

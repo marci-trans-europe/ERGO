@@ -6,6 +6,7 @@ import { FormEvent, useState } from 'react'
 import { checkDatabase, saveSettings } from '@/lib/desktop'
 import type { DesktopSettings, SettingsInput } from '@/lib/types'
 import type { AppUpdateState } from '@/components/use-app-updater'
+import { KnowledgeSettings } from '@/components/knowledge-settings'
 import { UpdateSettings } from '@/components/update-settings'
 
 type SettingsDialogProps = {
@@ -229,6 +230,8 @@ export const SettingsDialog = ({
               </label>
             </div>
           </fieldset>
+
+          <KnowledgeSettings />
 
           <UpdateSettings
             onCheck={onCheckForUpdate}

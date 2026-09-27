@@ -1,6 +1,7 @@
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
+import { AnalysisFeedback } from '@/components/analysis-feedback'
 import { QueryResultCard } from '@/components/query-result-card'
 import type { ChatMessage } from '@/lib/types'
 
@@ -22,6 +23,9 @@ export const MessageView = ({ message }: MessageViewProps) => (
           </ReactMarkdown>
         </div>
         {message.result ? <QueryResultCard result={message.result} /> : null}
+        {message.role === 'assistant' ? (
+          <AnalysisFeedback message={message} />
+        ) : null}
       </div>
     </div>
   </article>

@@ -226,6 +226,7 @@ export const useErpChat = () => {
           id: messageId(),
           role: 'assistant',
           content: response.summary,
+          question: trimmedContent,
           result: response.result,
         },
       ])

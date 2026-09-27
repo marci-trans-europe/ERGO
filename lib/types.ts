@@ -69,10 +69,49 @@ export type ChatMessage = {
   id: string
   role: 'user' | 'assistant'
   content: string
+  question?: string
   result?: QueryResult
 }
 
 export type AnalyzeResponse = {
   summary: string
   result?: QueryResult
+}
+
+export type AnalysisFeedbackInput = {
+  rating: 'positive' | 'negative'
+  category?:
+    | 'entity'
+    | 'metric'
+    | 'period'
+    | 'relationship'
+    | 'missing-results'
+    | 'summary'
+    | 'visualization'
+    | 'other'
+  correction: string
+  question: string
+  answer: string
+  resultTitle?: string
+  sql?: string
+  querySource?: QueryResult['querySource']
+  rowCount?: number
+}
+
+export type KnowledgeOverview = {
+  version: string
+  metricCount: number
+  relationshipCount: number
+  entityRuleCount: number
+  skillCount: number
+  feedbackTotal: number
+  feedbackPending: number
+  recentFeedback: Array<{
+    id: string
+    createdAt: number
+    category?: string
+    question: string
+    correction: string
+    status: string
+  }>
 }

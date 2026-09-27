@@ -1,0 +1,99 @@
+{
+  "version": "1.0.0",
+  "metrics": [
+    {
+      "id": "net_invoiced_revenue_base",
+      "label": "Nettó számlázott árbevétel alapdevizában",
+      "definition": "A Trans-Europe Zrt. könyvelt kimenő számláinak nettó alapdevizás értéke, a jóváírások levonásával.",
+      "rules": [
+        "companynumber = '1'",
+        "posted = 1",
+        "számlafejen invoice.itemsumbase",
+        "cikkszinten invoiceline.linepricebase",
+        "debitcredit = 1 esetén negatív előjel",
+        "vatbase nem árbevétel"
+      ]
+    },
+    {
+      "id": "overdue_receivable",
+      "label": "Lejárt kintlévőség",
+      "definition": "A mai napnál korábbi esedékességű, pozitív fennmaradó vevőkövetelés.",
+      "rules": [
+        "customerentry.remainderstandard > 0",
+        "duedate < CURRENT_DATE",
+        "a számlakapcsolatnál a companynumber értékét is egyeztetni kell"
+      ]
+    }
+  ],
+  "relationships": [
+    {
+      "id": "outgoing_invoice_lines",
+      "label": "Kimenő számla és cikksor",
+      "path": "invoice -> invoiceline",
+      "join": "invoice.companynumber = invoiceline.companynumber AND invoice.invoicenumber = invoiceline.invoicenumber"
+    },
+    {
+      "id": "billed_customer",
+      "label": "Számlázott partner",
+      "path": "invoice -> customer",
+      "join": "invoice.customernumber = customer.customernumber"
+    },
+    {
+      "id": "actual_end_customer",
+      "label": "Tényleges végfelhasználó",
+      "path": "invoice/invoiceline -> endcustomer",
+      "join": "COALESCE(NULLIF(invoice.endcustomernumber, ''), NULLIF(invoiceline.endcustomernumber, '')) = endcustomer.endcustomernumber"
+    },
+    {
+      "id": "receivable_invoice",
+      "label": "Vevőkövetelés és számla",
+      "path": "customerentry -> invoice",
+      "join": "customerentry.companynumber = invoice.companynumber AND customerentry.transactionnumber = invoice.invoicenumber"
+    }
+  ],
+  "entities": [
+    {
+      "id": "obh",
+      "label": "Országos Bírósági Hivatal",
+      "queryAliases": ["obh", "orszagos birosagi hivatal"],
+      "exactCodes": ["birosag", "orszagosbirosagi"],
+      "excludedCodes": ["obh"]
+    }
+  ],
+  "normalizationAliases": [
+    { "from": "szoft", "to": "soft" },
+    { "from": "soft", "to": "szoft" }
+  ],
+  "skills": [
+    {
+      "id": "revenue_trend",
+      "label": "Árbevételi trend",
+      "execution": "fixed_sql",
+      "examples": ["Mutasd az árbevétel havi trendjét"]
+    },
+    {
+      "id": "top_customers",
+      "label": "Top számlázott ügyfelek",
+      "execution": "fixed_sql",
+      "examples": ["Melyik 10 ügyfél hozta a legtöbb árbevételt?"]
+    },
+    {
+      "id": "top_end_customers",
+      "label": "Top végfelhasználók",
+      "execution": "fixed_sql",
+      "examples": ["Sorold fel a top 5 végfelhasználót"]
+    },
+    {
+      "id": "end_customer_purchases",
+      "label": "Végfelhasználó vásárolt cikkei",
+      "execution": "entity_resolution_and_fixed_sql",
+      "examples": ["Miket vásárolt az Idomszoft végfelhasználó?"]
+    },
+    {
+      "id": "overdue_receivables",
+      "label": "Lejárt kintlévőségek",
+      "execution": "fixed_sql",
+      "examples": ["Készíts összefoglalót a lejárt kintlévőségekről"]
+    }
+  ]
+}

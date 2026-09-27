@@ -4,6 +4,7 @@ use std::{
     fs,
     path::PathBuf,
     process::Command,
+    sync::{Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -162,6 +163,165 @@ struct AiCallResult {
     usage: TokenUsage,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgePack {
+    version: String,
+    metrics: Vec<KnowledgeMetric>,
+    relationships: Vec<KnowledgeRelationship>,
+    entities: Vec<KnowledgeEntity>,
+    normalization_aliases: Vec<NormalizationAlias>,
+    skills: Vec<KnowledgeSkill>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct KnowledgeMetric {
+    id: String,
+    label: String,
+    definition: String,
+    rules: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct KnowledgeRelationship {
+    id: String,
+    label: String,
+    path: String,
+    join: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeEntity {
+    id: String,
+    label: String,
+    query_aliases: Vec<String>,
+    exact_codes: Vec<String>,
+    excluded_codes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct NormalizationAlias {
+    from: String,
+    to: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct KnowledgeSkill {
+    id: String,
+    label: String,
+    execution: String,
+    examples: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeOverview {
+    version: String,
+    metric_count: usize,
+    relationship_count: usize,
+    entity_rule_count: usize,
+    skill_count: usize,
+    feedback_total: usize,
+    feedback_pending: usize,
+    recent_feedback: Vec<FeedbackSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedbackSummary {
+    id: String,
+    created_at: u64,
+    category: Option<String>,
+    question: String,
+    correction: String,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalysisFeedbackInput {
+    rating: String,
+    category: Option<String>,
+    correction: String,
+    question: String,
+    answer: String,
+    result_title: Option<String>,
+    sql: Option<String>,
+    query_source: Option<String>,
+    row_count: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalysisFeedbackRecord {
+    id: String,
+    created_at: u64,
+    app_version: String,
+    model: String,
+    analysis_fy_window: u8,
+    rating: String,
+    category: Option<String>,
+    correction: String,
+    question: String,
+    answer: String,
+    result_title: Option<String>,
+    sql: Option<String>,
+    query_source: Option<String>,
+    row_count: Option<usize>,
+    status: String,
+}
+
+static KNOWLEDGE_PACK: OnceLock<KnowledgePack> = OnceLock::new();
+static FEEDBACK_FILE_LOCK: Mutex<()> = Mutex::new(());
+
+fn knowledge_pack() -> &'static KnowledgePack {
+    KNOWLEDGE_PACK.get_or_init(|| {
+        serde_json::from_str(include_str!("../knowledge/knowledge-pack.json"))
+            .expect("the embedded ERGO knowledge pack must be valid JSON")
+    })
+}
+
+fn knowledge_prompt_context() -> String {
+    let pack = knowledge_pack();
+    let mut context = format!("ERGO Knowledge Pack {}\n", pack.version);
+    for metric in &pack.metrics {
+        context.push_str(&format!(
+            "- Mérőszám [{}] {}: {} Szabályok: {}.\n",
+            metric.id,
+            metric.label,
+            metric.definition,
+            metric.rules.join("; ")
+        ));
+    }
+    for relationship in &pack.relationships {
+        context.push_str(&format!(
+            "- Reláció [{}] {}: {}; kapcsolás: {}.\n",
+            relationship.id, relationship.label, relationship.path, relationship.join
+        ));
+    }
+    for entity in &pack.entities {
+        context.push_str(&format!(
+            "- Entitás [{}] {}: kérdésaliasok {}; pontos kódok {}; kizárt kódok {}.\n",
+            entity.id,
+            entity.label,
+            entity.query_aliases.join(" | "),
+            entity.exact_codes.join(" | "),
+            entity.excluded_codes.join(" | ")
+        ));
+    }
+    for skill in &pack.skills {
+        context.push_str(&format!(
+            "- Skill [{}] {}: végrehajtás {}; példák: {}.\n",
+            skill.id,
+            skill.label,
+            skill.execution,
+            skill.examples.join(" | ")
+        ));
+    }
+    context
+}
+
 fn fixed_quick_plan(quick_analysis: &str, analysis_fy_window: u8) -> Result<QueryPlan, String> {
     let fiscal_year_start = format!(
         "MAKEDATE(YEAR(CURRENT_DATE) - {}, 1)",
@@ -194,6 +354,40 @@ fn fixed_quick_plan(quick_analysis: &str, analysis_fy_window: u8) -> Result<Quer
     }
 }
 
+fn requested_top_end_customer_limit(question: &str) -> Option<usize> {
+    let normalized = normalize_for_search(question);
+    if !normalized.contains("vegfelhasznalo") {
+        return None;
+    }
+    let captures = Regex::new(r"\btop\s+(\d{1,2})\b")
+        .expect("valid top end-customer regex")
+        .captures(&normalized)?;
+    captures
+        .get(1)?
+        .as_str()
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| (1..=20).contains(limit))
+}
+
+fn top_end_customers_plan(question: &str, analysis_fy_window: u8) -> Option<QueryPlan> {
+    let limit = requested_top_end_customer_limit(question)?;
+    let fiscal_year_start = format!(
+        "MAKEDATE(YEAR(CURRENT_DATE) - {}, 1)",
+        analysis_fy_window - 1
+    );
+    Some(QueryPlan {
+        sql: format!(
+            "SELECT sales.vegfelhasznalo_kod, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', ec.name1, ec.name2, ec.name3, ec.name4, ec.name5)), ''), sales.vegfelhasznalo_kod) AS vegfelhasznalo, ROUND(SUM(CASE WHEN sales.debitcredit = 0 THEN sales.linepricebase ELSE -sales.linepricebase END), 2) AS netto_szamlazott_arbevetel_alapdevizaban, COUNT(DISTINCT sales.invoicenumber) AS szamlak_szama FROM (SELECT i.invoicenumber, i.debitcredit, COALESCE(il.linepricebase, 0) AS linepricebase, COALESCE(NULLIF(i.endcustomernumber, ''), NULLIF(il.endcustomernumber, '')) AS vegfelhasznalo_kod FROM invoice i JOIN invoiceline il ON il.companynumber = i.companynumber AND il.invoicenumber = i.invoicenumber WHERE i.companynumber = '1' AND i.posted = 1 AND STR_TO_DATE(i.invoicedate, '%Y.%m.%d') >= {fiscal_year_start} AND STR_TO_DATE(i.invoicedate, '%Y.%m.%d') <= CURRENT_DATE AND COALESCE(NULLIF(i.endcustomernumber, ''), NULLIF(il.endcustomernumber, '')) IS NOT NULL) sales LEFT JOIN endcustomer ec ON ec.endcustomernumber = sales.vegfelhasznalo_kod GROUP BY sales.vegfelhasznalo_kod, ec.name1, ec.name2, ec.name3, ec.name4, ec.name5 HAVING SUM(CASE WHEN sales.debitcredit = 0 THEN sales.linepricebase ELSE -sales.linepricebase END) > 0.004 ORDER BY netto_szamlazott_arbevetel_alapdevizaban DESC LIMIT {limit}"
+        ),
+        title: format!(
+            "Top {limit} végfelhasználó az elmúlt {analysis_fy_window} FY nettó számlázott árbevétele alapján"
+        ),
+        visualization: "bar".into(),
+        max_rows: limit,
+    })
+}
+
 fn end_customer_purchase_plan(
     label: &str,
     end_customer_codes: &[String],
@@ -220,15 +414,28 @@ fn end_customer_purchase_plan(
 
 fn fixed_relationship_plan(question: &str, analysis_fy_window: u8) -> Option<QueryPlan> {
     let normalized = normalize_for_search(question);
-    let is_obh = normalized.contains("obh") || normalized.contains("orszagos birosagi hivatal");
-    if !is_obh || !is_customer_purchase_question(question) {
+    if !is_customer_purchase_question(question) {
         return None;
     }
-    Some(end_customer_purchase_plan(
-        "Az OBH",
-        &["birosag".into(), "orszagosbirosagi".into()],
-        analysis_fy_window,
-    ))
+    let entity = knowledge_pack().entities.iter().find(|entity| {
+        entity
+            .query_aliases
+            .iter()
+            .any(|alias| normalized.contains(alias))
+    })?;
+    let excluded = entity
+        .excluded_codes
+        .iter()
+        .map(|code| normalize_for_search(code))
+        .collect::<HashSet<_>>();
+    let codes = entity
+        .exact_codes
+        .iter()
+        .filter(|code| !excluded.contains(&normalize_for_search(code)))
+        .cloned()
+        .collect::<Vec<_>>();
+    (!codes.is_empty())
+        .then(|| end_customer_purchase_plan(&entity.label, &codes, analysis_fy_window))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -289,6 +496,86 @@ fn schema_cache_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_config_dir()
         .map(|directory| directory.join("schema-catalog.json"))
         .map_err(|error| format!("A helyi sémagyorsítótár útvonala nem érhető el: {error}"))
+}
+
+fn feedback_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("analysis-feedback.json"))
+        .map_err(|error| format!("A helyi visszajelzési tár útvonala nem érhető el: {error}"))
+}
+
+fn read_feedback_records(app: &AppHandle) -> Result<Vec<AnalysisFeedbackRecord>, String> {
+    let path = feedback_path(app)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("A helyi visszajelzések nem olvashatók: {error}"))?;
+    serde_json::from_str(&contents)
+        .map_err(|error| format!("A helyi visszajelzési tár sérült: {error}"))
+}
+
+fn write_feedback_records(
+    app: &AppHandle,
+    records: &[AnalysisFeedbackRecord],
+) -> Result<(), String> {
+    let path = feedback_path(app)?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "Érvénytelen visszajelzési útvonal.".to_string())?;
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("A visszajelzési mappa nem hozható létre: {error}"))?;
+    let contents = serde_json::to_vec_pretty(records)
+        .map_err(|error| format!("A visszajelzések nem alakíthatók át: {error}"))?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, contents)
+        .map_err(|error| format!("A visszajelzés nem menthető: {error}"))?;
+    fs::rename(&temporary, &path)
+        .map_err(|error| format!("A visszajelzési tár nem véglegesíthető: {error}"))
+}
+
+fn validate_feedback(input: &AnalysisFeedbackInput) -> Result<(), String> {
+    if !matches!(input.rating.as_str(), "positive" | "negative") {
+        return Err("Ismeretlen visszajelzési értékelés.".into());
+    }
+    if input.question.trim().is_empty() || input.question.chars().count() > 5_000 {
+        return Err("A visszajelzés kérdése üres vagy túl hosszú.".into());
+    }
+    if input.answer.trim().is_empty() || input.answer.chars().count() > 16_000 {
+        return Err("A visszajelzés válasza üres vagy túl hosszú.".into());
+    }
+    if input.correction.chars().count() > 4_000 {
+        return Err("A javítás legfeljebb 4000 karakter lehet.".into());
+    }
+    if input.rating == "negative" && input.correction.trim().is_empty() {
+        return Err("Írd le röviden, mit kellene javítani.".into());
+    }
+    if input
+        .sql
+        .as_ref()
+        .is_some_and(|sql| sql.chars().count() > 12_000)
+    {
+        return Err("A visszajelzéshez tartozó SQL túl hosszú.".into());
+    }
+    let allowed_categories = [
+        "entity",
+        "metric",
+        "period",
+        "relationship",
+        "missing-results",
+        "summary",
+        "visualization",
+        "other",
+    ];
+    if input
+        .category
+        .as_ref()
+        .is_some_and(|category| !allowed_categories.contains(&category.as_str()))
+    {
+        return Err("Ismeretlen visszajelzési kategória.".into());
+    }
+    Ok(())
 }
 
 fn read_settings(app: &AppHandle) -> Result<StoredSettings, String> {
@@ -548,6 +835,132 @@ fn open_feedback_email(app: AppHandle, message: String) -> Result<(), String> {
         percent_encode_mailto(&body)
     );
 
+    Command::new("open")
+        .arg(mailto)
+        .spawn()
+        .map_err(|error| format!("A levelezőalkalmazás nem nyitható meg: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn save_analysis_feedback(
+    app: AppHandle,
+    feedback: AnalysisFeedbackInput,
+) -> Result<String, String> {
+    validate_feedback(&feedback)?;
+    let _guard = FEEDBACK_FILE_LOCK
+        .lock()
+        .map_err(|_| "A helyi visszajelzési tár zárolása sikertelen.".to_string())?;
+    let settings = read_settings(&app)?;
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let id = format!("feedback-{created_at}-{}", std::process::id());
+    let status = if feedback.rating == "negative" {
+        "pending"
+    } else {
+        "recorded"
+    };
+    let record = AnalysisFeedbackRecord {
+        id: id.clone(),
+        created_at,
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        model: settings.ai_model,
+        analysis_fy_window: settings.analysis_fy_window,
+        rating: feedback.rating,
+        category: feedback.category,
+        correction: feedback.correction.trim().into(),
+        question: feedback.question.trim().into(),
+        answer: feedback.answer.trim().into(),
+        result_title: feedback.result_title,
+        sql: feedback.sql,
+        query_source: feedback.query_source,
+        row_count: feedback.row_count,
+        status: status.into(),
+    };
+    let mut records = read_feedback_records(&app)?;
+    records.push(record);
+    if records.len() > 500 {
+        let remove_count = records.len() - 500;
+        records.drain(0..remove_count);
+    }
+    write_feedback_records(&app, &records)?;
+    Ok(id)
+}
+
+#[tauri::command]
+fn load_knowledge_overview(app: AppHandle) -> Result<KnowledgeOverview, String> {
+    let _guard = FEEDBACK_FILE_LOCK
+        .lock()
+        .map_err(|_| "A helyi visszajelzési tár zárolása sikertelen.".to_string())?;
+    let feedback = read_feedback_records(&app)?;
+    let pack = knowledge_pack();
+    let recent_feedback = feedback
+        .iter()
+        .rev()
+        .filter(|record| record.rating == "negative")
+        .take(10)
+        .map(|record| FeedbackSummary {
+            id: record.id.clone(),
+            created_at: record.created_at,
+            category: record.category.clone(),
+            question: record.question.clone(),
+            correction: record.correction.clone(),
+            status: record.status.clone(),
+        })
+        .collect();
+    Ok(KnowledgeOverview {
+        version: pack.version.clone(),
+        metric_count: pack.metrics.len(),
+        relationship_count: pack.relationships.len(),
+        entity_rule_count: pack.entities.len(),
+        skill_count: pack.skills.len(),
+        feedback_total: feedback.len(),
+        feedback_pending: feedback
+            .iter()
+            .filter(|record| record.status == "pending")
+            .count(),
+        recent_feedback,
+    })
+}
+
+#[tauri::command]
+fn open_analysis_feedback_email(app: AppHandle, feedback_id: String) -> Result<(), String> {
+    let record = {
+        let _guard = FEEDBACK_FILE_LOCK
+            .lock()
+            .map_err(|_| "A helyi visszajelzési tár zárolása sikertelen.".to_string())?;
+        read_feedback_records(&app)?
+            .into_iter()
+            .find(|record| record.id == feedback_id)
+            .ok_or_else(|| "A visszajelzés nem található.".to_string())?
+    };
+    let category = record.category.as_deref().unwrap_or("nincs megadva");
+    let result_title = record
+        .result_title
+        .as_deref()
+        .unwrap_or("nincs eredménykártya");
+    let query_source = record.query_source.as_deref().unwrap_or("nincs adat");
+    let sql = record.sql.as_deref().unwrap_or("nincs SQL");
+    let concise_answer = record.answer.chars().take(3_000).collect::<String>();
+    let concise_sql = sql.chars().take(3_000).collect::<String>();
+    let subject = format!("ERGO {} elemzési javítás", record.app_version);
+    let body = format!(
+        "ERGO elemzési visszajelzés\n\nKategória: {category}\nJavítás:\n{}\n\nEredeti kérdés:\n{}\n\nERGO válasza:\n{concise_answer}\n\nEredmény: {result_title}\nForrás: {query_source}\nSorok: {}\n\nSQL:\n{concise_sql}\n\n---\nVisszajelzés: {}\nVerzió: {}\nModell: {}\nIdőablak: {} FY\n\nA levél nem tartalmaz API-kulcsot, adatbázis-jelszót vagy nyers lekérdezési sorokat.",
+        record.correction,
+        record.question,
+        record.row_count.map(|count| count.to_string()).unwrap_or_else(|| "nincs adat".into()),
+        record.id,
+        record.app_version,
+        record.model,
+        record.analysis_fy_window,
+    );
+    let mailto = format!(
+        "mailto:{FEEDBACK_EMAIL}?subject={}&body={}",
+        percent_encode_mailto(&subject),
+        percent_encode_mailto(&body)
+    );
     Command::new("open")
         .arg(mailto)
         .spawn()
@@ -876,7 +1289,7 @@ fn explicit_end_customer_name(question: &str) -> Option<String> {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    (safe.len() >= 4).then_some(safe)
+    (safe.len() >= 3).then_some(safe)
 }
 
 async fn resolve_end_customer(
@@ -885,7 +1298,7 @@ async fn resolve_end_customer(
     search_name: &str,
 ) -> Result<Vec<(String, String)>, String> {
     let compact_search = search_name.replace(' ', "");
-    if compact_search.len() < 4
+    if compact_search.len() < 3
         || !compact_search
             .chars()
             .all(|character| character.is_ascii_alphanumeric())
@@ -893,11 +1306,10 @@ async fn resolve_end_customer(
         return Ok(Vec::new());
     }
     let mut search_variants = vec![search_name.to_string()];
-    if search_name.contains("szoft") {
-        search_variants.push(search_name.replace("szoft", "soft"));
-    }
-    if search_name.contains("soft") {
-        search_variants.push(search_name.replace("soft", "szoft"));
+    for alias in &knowledge_pack().normalization_aliases {
+        if search_name.contains(&alias.from) {
+            search_variants.push(search_name.replace(&alias.from, &alias.to));
+        }
     }
     search_variants.sort();
     search_variants.dedup();
@@ -917,10 +1329,11 @@ async fn resolve_end_customer(
         .collect::<Vec<_>>()
         .join(" OR ");
     let sql = format!(
-        "SELECT endcustomernumber AS vegfelhasznalo_kod, COALESCE(NULLIF(TRIM(name1), ''), TRIM(CONCAT_WS(' ', name1, name2, name3, name4, name5))) AS vegfelhasznalo FROM endcustomer WHERE {name_conditions} ORDER BY CASE WHEN {exact_code_conditions} THEN 0 ELSE 1 END, endcustomernumber LIMIT 20"
+        "SELECT endcustomernumber AS vegfelhasznalo_kod, COALESCE(NULLIF(TRIM(name1), ''), TRIM(CONCAT_WS(' ', name1, name2, name3, name4, name5))) AS vegfelhasznalo, TRIM(CONCAT_WS(' ', name1, name2, name3, name4, name5)) AS vegfelhasznalo_keresheto FROM endcustomer WHERE {name_conditions} ORDER BY CASE WHEN {exact_code_conditions} THEN 0 ELSE 1 END, endcustomernumber LIMIT 100"
     );
-    let (_, rows, _) = run_query(settings, password, &sql, 20).await?;
-    let mut matches = rows
+    let (_, rows, _) = run_query(settings, password, &sql, 100).await?;
+    let mut seen_codes = HashSet::new();
+    let matches = rows
         .into_iter()
         .filter_map(|row| {
             let code = row.get("vegfelhasznalo_kod")?.as_str()?.trim().to_string();
@@ -930,11 +1343,33 @@ async fn resolve_end_customer(
                 .unwrap_or(&code)
                 .trim()
                 .to_string();
-            (!code.is_empty()).then_some((code, name))
+            let searchable_name = row
+                .get("vegfelhasznalo_keresheto")
+                .and_then(JsonValue::as_str)
+                .unwrap_or(&name);
+            let matches_organization = search_variants.iter().any(|variant| {
+                normalize_for_search(&code)
+                    .split_whitespace()
+                    .collect::<String>()
+                    == variant.split_whitespace().collect::<String>()
+                    || contains_token_phrase(searchable_name, variant)
+            });
+            (!code.is_empty() && matches_organization && seen_codes.insert(code.clone()))
+                .then_some((code, name))
         })
         .collect::<Vec<_>>();
-    matches.dedup_by(|left, right| left.0 == right.0);
     Ok(matches)
+}
+
+fn contains_token_phrase(value: &str, phrase: &str) -> bool {
+    let value = normalize_for_search(value);
+    let phrase = normalize_for_search(phrase);
+    let value_tokens = value.split_whitespace().collect::<Vec<_>>();
+    let phrase_tokens = phrase.split_whitespace().collect::<Vec<_>>();
+    !phrase_tokens.is_empty()
+        && value_tokens
+            .windows(phrase_tokens.len())
+            .any(|window| window == phrase_tokens)
 }
 
 fn business_relationship_skill(question: &str) -> &'static str {
@@ -1634,7 +2069,27 @@ async fn call_ai(
         })
     };
     if json_mode && uses_responses_api {
-        request["text"] = json!({ "format": { "type": "json_object" } });
+        request["text"] = json!({
+            "format": {
+                "type": "json_schema",
+                "name": "erp_query_plan",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "sql": { "type": "string" },
+                        "title": { "type": "string" },
+                        "visualization": {
+                            "type": "string",
+                            "enum": ["table", "bar", "line"]
+                        },
+                        "maxRows": { "type": "integer", "minimum": 1, "maximum": 200 }
+                    },
+                    "required": ["sql", "title", "visualization", "maxRows"],
+                    "additionalProperties": false
+                }
+            }
+        });
     } else if json_mode {
         request["response_format"] = json!({ "type": "json_object" });
     }
@@ -1836,7 +2291,8 @@ async fn analyze_erp(
     )?;
     let api_key = read_secret(&app, "AI_API_KEY", AI_API_KEY_ACCOUNT, "AI API-kulcs")?;
     let analysis_fy_window = validate_analysis_fy_window(settings.analysis_fy_window)?;
-    let mut relationship_plan = fixed_relationship_plan(question.trim(), analysis_fy_window);
+    let mut relationship_plan = top_end_customers_plan(question.trim(), analysis_fy_window)
+        .or_else(|| fixed_relationship_plan(question.trim(), analysis_fy_window));
     if relationship_plan.is_none() {
         if let Some(search_name) = explicit_end_customer_name(question.trim()) {
             let matches =
@@ -1916,6 +2372,7 @@ async fn analyze_erp(
         analysis_fy_window - 1
     );
     let relationship_skill = business_relationship_skill(question.trim());
+    let knowledge_context = knowledge_prompt_context();
     let planner_system = format!(
         r#"Te az ERGO, a Trans-Europe óvatos ERP-adatelemzője vagy.
 Készíts pontos MySQL lekérdezési tervet a megadott adatbázis-séma alapján.
@@ -1940,6 +2397,8 @@ Időfüggő üzleti adatoknál kötelező közvetlenül az SQL WHERE feltételé
 - fejlécszámhoz ne kapcsolj tételtáblát, ha a kérdés nem kér tételszintű adatot.
 
 {relationship_skill}
+Helyi, verziózott ERP-tudás:
+{knowledge_context}
 Kizárólag JSON objektummal válaszolj ebben az alakban:
 {{"sql":"...","title":"rövid magyar cím","visualization":"table|bar|line","maxRows":50}}
 
@@ -2028,8 +2487,11 @@ pub fn run() {
             analyze_quick_erp,
             check_database,
             list_ai_models,
+            load_knowledge_overview,
             load_settings,
+            open_analysis_feedback_email,
             open_feedback_email,
+            save_analysis_feedback,
             save_settings,
             select_ai_model,
             select_analysis_fy_window
@@ -2042,11 +2504,14 @@ pub fn run() {
 mod tests {
     use super::{
         assert_read_only_sql, business_relationship_skill, capability_answer,
-        end_customer_purchase_plan, explicit_end_customer_name, extract_json, fixed_quick_plan,
-        fixed_relationship_plan, is_chat_model, percent_encode_mailto, resolve_end_customer,
-        responses_input, run_query, schema_search_terms, select_schema_context,
-        table_business_metadata, validate_analysis_fy_window, validate_model, validate_planned_sql,
-        CatalogColumn, JsonValue, QueryPlan, SchemaCatalog, SchemaTable, StoredSettings,
+        contains_token_phrase, end_customer_purchase_plan, explicit_end_customer_name,
+        extract_json, fixed_quick_plan, fixed_relationship_plan, is_chat_model, knowledge_pack,
+        knowledge_prompt_context, normalize_for_search, percent_encode_mailto,
+        requested_top_end_customer_limit, resolve_end_customer, responses_input, run_query,
+        schema_search_terms, select_schema_context, table_business_metadata,
+        top_end_customers_plan, validate_analysis_fy_window, validate_feedback, validate_model,
+        validate_planned_sql, AnalysisFeedbackInput, CatalogColumn, JsonValue, QueryPlan,
+        SchemaCatalog, SchemaTable, StoredSettings,
     };
 
     #[test]
@@ -2185,7 +2650,82 @@ mod tests {
             explicit_end_customer_name("Mit rendelt a Magyar Posta végfelhasználó?"),
             Some("magyar posta".into())
         );
+        assert_eq!(
+            explicit_end_customer_name("Mit vásárolt a MÁV végfelhasználó?"),
+            Some("mav".into())
+        );
         assert!(explicit_end_customer_name("Miket vásárolt a Designshop?").is_none());
+    }
+
+    #[test]
+    fn embedded_knowledge_pack_is_available_to_planning() {
+        let pack = knowledge_pack();
+        assert_eq!(pack.version, "1.0.0");
+        assert!(pack
+            .metrics
+            .iter()
+            .any(|metric| metric.id == "net_invoiced_revenue_base"));
+        assert!(pack
+            .relationships
+            .iter()
+            .any(|relationship| relationship.id == "actual_end_customer"));
+        assert!(pack
+            .skills
+            .iter()
+            .any(|skill| skill.id == "top_end_customers"));
+        let context = knowledge_prompt_context();
+        assert!(context.contains("vatbase nem árbevétel"));
+        assert!(context.contains("invoice/invoiceline -> endcustomer"));
+    }
+
+    #[test]
+    fn validates_structured_analysis_feedback() {
+        let valid = AnalysisFeedbackInput {
+            rating: "negative".into(),
+            category: Some("entity".into()),
+            correction: "Az AERONAUTICA nem AERON.".into(),
+            question: "Mit vásárolt az AERON végfelhasználó?".into(),
+            answer: "Három találat érkezett.".into(),
+            result_title: Some("AERON vásárlásai".into()),
+            sql: Some("SELECT 1".into()),
+            query_source: Some("fixed".into()),
+            row_count: Some(3),
+        };
+        assert!(validate_feedback(&valid).is_ok());
+        let invalid = AnalysisFeedbackInput {
+            correction: String::new(),
+            ..valid
+        };
+        assert!(validate_feedback(&invalid).is_err());
+    }
+
+    #[test]
+    fn end_customer_names_match_complete_tokens_instead_of_substrings() {
+        assert!(contains_token_phrase("AERON Zrt. Dorottya u. 1.", "aeron"));
+        assert!(!contains_token_phrase(
+            "AUTORITATEA AERONAUTICA CIVILA ROMANA",
+            "aeron"
+        ));
+        assert!(contains_token_phrase("MÁV-START Zrt.", "mav"));
+        assert!(contains_token_phrase("MÁV Szolgáltató Központ Zrt.", "mav"));
+        assert!(!contains_token_phrase("MAVIR Zrt.", "mav"));
+    }
+
+    #[test]
+    fn top_end_customer_questions_have_a_fixed_plan() {
+        let question = "Sorold fel a top 5 végfelhasználót!";
+        assert_eq!(requested_top_end_customer_limit(question), Some(5));
+        let plan = top_end_customers_plan(question, 1).expect("top query must have a fixed plan");
+        assert_eq!(plan.max_rows, 5);
+        assert_eq!(plan.visualization, "bar");
+        assert!(plan.sql.contains("invoice i JOIN invoiceline il"));
+        assert!(plan.sql.contains("endcustomernumber"));
+        assert!(plan.sql.contains("i.companynumber = '1'"));
+        assert!(plan.sql.contains("i.posted = 1"));
+        assert!(plan.sql.contains("i.debitcredit"));
+        assert!(plan.sql.contains("il.linepricebase"));
+        assert!(plan.sql.ends_with("LIMIT 5"));
+        assert!(top_end_customers_plan("Sorold fel a top 5 ügyfelet!", 1).is_none());
     }
 
     #[test]
@@ -2302,6 +2842,72 @@ mod tests {
                 .await
                 .expect("IdomSoft item query must succeed");
             assert!(!rows.is_empty(), "IdomSoft item query returned no rows");
+        });
+    }
+
+    #[test]
+    #[ignore = "VPN-t és helyi .env fájlt igényel"]
+    fn live_end_customer_resolution_avoids_substrings_and_keeps_company_families() {
+        let env_path = std::env::var("ERGO_ENV_PATH").expect("ERGO_ENV_PATH is required");
+        let contents = std::fs::read_to_string(env_path).expect("the .env file must be readable");
+        let password = contents
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("MYSQL_PASSWORD="))
+            .map(|value| value.trim().trim_matches(['\'', '"']).to_string())
+            .filter(|value| !value.is_empty())
+            .expect("MYSQL_PASSWORD must be present");
+
+        tauri::async_runtime::block_on(async {
+            let settings = StoredSettings::default();
+            let aeron = resolve_end_customer(&settings, password.clone(), "aeron")
+                .await
+                .expect("AERON resolution must succeed");
+            assert!(!aeron.is_empty(), "AERON was not resolved");
+            assert!(aeron.iter().all(|(code, name)| {
+                code.eq_ignore_ascii_case("aeron") || contains_token_phrase(name, "aeron")
+            }));
+            assert!(aeron.iter().all(|(_, name)| {
+                !normalize_for_search(name).contains("autoritatea aeronautica")
+            }));
+
+            let mav = resolve_end_customer(&settings, password, "mav")
+                .await
+                .expect("MÁV resolution must succeed");
+            assert!(
+                mav.len() > 1,
+                "MÁV company-family variants were not resolved"
+            );
+            assert!(mav.iter().all(|(code, name)| {
+                code.eq_ignore_ascii_case("mav") || contains_token_phrase(name, "mav")
+            }));
+        });
+    }
+
+    #[test]
+    #[ignore = "VPN-t és helyi .env fájlt igényel"]
+    fn live_top_end_customers_returns_five_ranked_rows() {
+        let env_path = std::env::var("ERGO_ENV_PATH").expect("ERGO_ENV_PATH is required");
+        let contents = std::fs::read_to_string(env_path).expect("the .env file must be readable");
+        let password = contents
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("MYSQL_PASSWORD="))
+            .map(|value| value.trim().trim_matches(['\'', '"']).to_string())
+            .filter(|value| !value.is_empty())
+            .expect("MYSQL_PASSWORD must be present");
+        let plan = top_end_customers_plan("Sorold fel a top 5 végfelhasználót!", 1)
+            .expect("top query must have a fixed plan");
+
+        tauri::async_runtime::block_on(async {
+            let settings = StoredSettings::default();
+            let (_, rows, truncated) = run_query(&settings, password, &plan.sql, plan.max_rows)
+                .await
+                .expect("top end-customer query must succeed");
+            assert_eq!(rows.len(), 5);
+            assert!(!truncated);
+            assert!(rows[0].get("vegfelhasznalo_kod").is_some());
+            assert!(rows[0]
+                .get("netto_szamlazott_arbevetel_alapdevizaban")
+                .is_some());
         });
     }
 
