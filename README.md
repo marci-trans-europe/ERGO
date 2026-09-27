@@ -65,6 +65,12 @@ kintlévőségi gyorsnézet a nyitott vevői tételt a számlafejhez és a
 számlasorokhoz kapcsolja, ezért számlánként a konkrét cikkeket, mennyiségeket
 és nettó sorértékeket is megmutatja.
 
+Az árbevételi gyorsnézetek egységes üzleti definíciót használnak: kizárólag a
+Trans Europe Zrt. (`companynumber = '1'`) könyvelt számláit számítják, a
+számlafej vállalati alapdevizás nettó értékéből, a jóváírások levonásával. A
+dinamikus lekérdezések ellenőrzése ugyanezeket a szabályokat kényszeríti ki;
+az áfaösszeg (`vatbase`) nem használható árbevételként.
+
 Az alkalmazás nem küldi el a teljes adatbázissémát minden kérdéssel. A táblák,
 oszlopok és idegen kulcsok katalógusát 24 órára helyben gyorsítótárazza, majd a
 magyar üzleti kérdés alapján legfeljebb 8 releváns táblát és táblánként 36

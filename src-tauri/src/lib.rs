@@ -170,21 +170,21 @@ fn fixed_quick_plan(quick_analysis: &str, analysis_fy_window: u8) -> Result<Quer
     match quick_analysis {
         "revenue-trend" => Ok(QueryPlan {
             sql: format!(
-                "SELECT DATE_FORMAT(STR_TO_DATE(il.invoicedate, '%Y.%m.%d'), '%Y-%m') AS honap, ROUND(SUM(il.vatbase), 2) AS arbevetel FROM invoiceline AS il WHERE STR_TO_DATE(il.invoicedate, '%Y.%m.%d') >= GREATEST(DATE_SUB(CURRENT_DATE, INTERVAL 12 MONTH), {fiscal_year_start}) AND STR_TO_DATE(il.invoicedate, '%Y.%m.%d') <= CURRENT_DATE GROUP BY DATE_FORMAT(STR_TO_DATE(il.invoicedate, '%Y.%m.%d'), '%Y-%m') ORDER BY honap ASC"
+                "SELECT DATE_FORMAT(STR_TO_DATE(i.invoicedate, '%Y.%m.%d'), '%Y-%m') AS honap, ROUND(SUM(CASE WHEN i.debitcredit = 0 THEN i.itemsumbase ELSE -i.itemsumbase END), 2) AS netto_szamlazott_arbevetel FROM invoice AS i WHERE i.companynumber = '1' AND i.posted = 1 AND STR_TO_DATE(i.invoicedate, '%Y.%m.%d') >= GREATEST(DATE_SUB(CURRENT_DATE, INTERVAL 12 MONTH), {fiscal_year_start}) AND STR_TO_DATE(i.invoicedate, '%Y.%m.%d') <= CURRENT_DATE GROUP BY DATE_FORMAT(STR_TO_DATE(i.invoicedate, '%Y.%m.%d'), '%Y-%m') ORDER BY honap ASC"
             ),
-            title: "Havi árbevételi trend".into(),
+            title: "Havi nettó számlázott árbevétel".into(),
             visualization: "line".into(),
             max_rows: 50,
         }),
         "top-customers" => Ok(QueryPlan {
-            sql: "SELECT il.customernumber AS ugyfelszam, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', c.name1, c.name2, c.name3, c.name4, c.name5)), ''), il.customernumber) AS ugyfel, ROUND(SUM(il.vatbase), 2) AS arbevetel FROM invoiceline AS il LEFT JOIN customer AS c ON c.customernumber = il.customernumber WHERE STR_TO_DATE(il.invoicedate, '%Y.%m.%d') >= MAKEDATE(YEAR(CURRENT_DATE), 1) AND STR_TO_DATE(il.invoicedate, '%Y.%m.%d') <= CURRENT_DATE GROUP BY il.customernumber, c.name1, c.name2, c.name3, c.name4, c.name5 ORDER BY arbevetel DESC LIMIT 10".into(),
-            title: "Top 10 ügyfél idei árbevétel szerint".into(),
+            sql: "SELECT i.customernumber AS ugyfelszam, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', c.name1, c.name2, c.name3, c.name4, c.name5)), ''), i.customernumber) AS ugyfel, ROUND(SUM(CASE WHEN i.debitcredit = 0 THEN i.itemsumbase ELSE -i.itemsumbase END), 2) AS netto_szamlazott_arbevetel FROM invoice AS i LEFT JOIN customer AS c ON c.customernumber = i.customernumber WHERE i.companynumber = '1' AND i.posted = 1 AND STR_TO_DATE(i.invoicedate, '%Y.%m.%d') >= MAKEDATE(YEAR(CURRENT_DATE), 1) AND STR_TO_DATE(i.invoicedate, '%Y.%m.%d') <= CURRENT_DATE GROUP BY i.customernumber, c.name1, c.name2, c.name3, c.name4, c.name5 ORDER BY netto_szamlazott_arbevetel DESC LIMIT 10".into(),
+            title: "Top 10 ügyfél idei nettó számlázott árbevétele".into(),
             visualization: "bar".into(),
             max_rows: 10,
         }),
         "overdue-receivables" => Ok(QueryPlan {
             sql: format!(
-                "SELECT ce.customernumber AS ugyfelszam, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', c.name1, c.name2, c.name3, c.name4, c.name5)), ''), ce.customernumber) AS ugyfel, ce.transactionnumber AS szamlaszam, DATE_FORMAT(STR_TO_DATE(ce.invoicedate, '%Y.%m.%d'), '%Y-%m-%d') AS szamla_datum, DATE_FORMAT(STR_TO_DATE(ce.duedate, '%Y.%m.%d'), '%Y-%m-%d') AS esedekesseg, DATEDIFF(CURRENT_DATE, STR_TO_DATE(ce.duedate, '%Y.%m.%d')) AS kesedelmes_napok, ROUND(COALESCE(i.totalstandard, ce.debitstandard - ce.creditstandard), 2) AS szamla_osszeg, ROUND(ce.remainderstandard, 2) AS kintlevoseg, COALESCE(i.standardcurrency, ce.originalcurrency) AS penznemkod, COUNT(il.linenumber) AS cikksorok_szama, GROUP_CONCAT(CASE WHEN il.linenumber IS NULL THEN 'Nincs kapcsolt számlasor' ELSE CONCAT_WS(' · ', COALESCE(NULLIF(il.itemnumber, ''), 'cikkszám nélkül'), COALESCE(NULLIF(il.itemtext1, ''), NULLIF(il.externalitemtext, ''), 'megnevezés nélkül'), CONCAT('menny.: ', COALESCE(il.numberinvoiced, 0)), CONCAT('nettó: ', COALESCE(il.vatbase, 0))) END ORDER BY il.linenumber SEPARATOR ' | ') AS cikkek FROM customerentry AS ce LEFT JOIN invoice AS i ON i.invoicenumber = ce.transactionnumber AND i.customernumber = ce.customernumber AND i.companynumber = ce.companynumber LEFT JOIN invoiceline AS il ON il.invoicenumber = i.invoicenumber AND il.companynumber = i.companynumber LEFT JOIN customer AS c ON c.customernumber = ce.customernumber WHERE STR_TO_DATE(ce.duedate, '%Y.%m.%d') < CURRENT_DATE AND STR_TO_DATE(ce.postingdate, '%Y.%m.%d') >= {fiscal_year_start} AND STR_TO_DATE(ce.postingdate, '%Y.%m.%d') <= CURRENT_DATE AND ce.remainderstandard > 0 GROUP BY ce.customernumber, c.name1, c.name2, c.name3, c.name4, c.name5, ce.transactionnumber, ce.invoicedate, ce.duedate, i.totalstandard, ce.debitstandard, ce.creditstandard, ce.remainderstandard, i.standardcurrency, ce.originalcurrency ORDER BY kintlevoseg DESC LIMIT 50"
+                "SELECT ce.customernumber AS ugyfelszam, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', c.name1, c.name2, c.name3, c.name4, c.name5)), ''), ce.customernumber) AS ugyfel, ce.transactionnumber AS szamlaszam, DATE_FORMAT(STR_TO_DATE(ce.invoicedate, '%Y.%m.%d'), '%Y-%m-%d') AS szamla_datum, DATE_FORMAT(STR_TO_DATE(ce.duedate, '%Y.%m.%d'), '%Y-%m-%d') AS esedekesseg, DATEDIFF(CURRENT_DATE, STR_TO_DATE(ce.duedate, '%Y.%m.%d')) AS kesedelmes_napok, ROUND(COALESCE(i.totalstandard, ce.debitstandard - ce.creditstandard), 2) AS szamla_osszeg, ROUND(ce.remainderstandard, 2) AS kintlevoseg, COALESCE(i.standardcurrency, ce.originalcurrency) AS penznemkod, COUNT(il.linenumber) AS cikksorok_szama, GROUP_CONCAT(CASE WHEN il.linenumber IS NULL THEN 'Nincs kapcsolt számlasor' ELSE CONCAT_WS(' · ', COALESCE(NULLIF(il.itemnumber, ''), 'cikkszám nélkül'), COALESCE(NULLIF(il.itemtext1, ''), NULLIF(il.externalitemtext, ''), 'megnevezés nélkül'), CONCAT('menny.: ', COALESCE(il.numberinvoiced, 0)), CONCAT('nettó: ', COALESCE(il.linepricebase, 0))) END ORDER BY il.linenumber SEPARATOR ' | ') AS cikkek FROM customerentry AS ce LEFT JOIN invoice AS i ON i.invoicenumber = ce.transactionnumber AND i.customernumber = ce.customernumber AND i.companynumber = ce.companynumber LEFT JOIN invoiceline AS il ON il.invoicenumber = i.invoicenumber AND il.companynumber = i.companynumber LEFT JOIN customer AS c ON c.customernumber = ce.customernumber WHERE ce.companynumber = '1' AND STR_TO_DATE(ce.duedate, '%Y.%m.%d') < CURRENT_DATE AND STR_TO_DATE(ce.postingdate, '%Y.%m.%d') >= {fiscal_year_start} AND STR_TO_DATE(ce.postingdate, '%Y.%m.%d') <= CURRENT_DATE AND ce.remainderstandard > 0 GROUP BY ce.customernumber, c.name1, c.name2, c.name3, c.name4, c.name5, ce.transactionnumber, ce.invoicedate, ce.duedate, i.totalstandard, ce.debitstandard, ce.creditstandard, ce.remainderstandard, i.standardcurrency, ce.originalcurrency ORDER BY kintlevoseg DESC LIMIT 50"
             ),
             title: "Lejárt kintlévőségek számlánként és cikksoronként".into(),
             visualization: "table".into(),
@@ -1203,6 +1203,48 @@ fn assert_read_only_sql(sql: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+fn validate_planned_sql(question: &str, sql: &str) -> Result<String, String> {
+    let normalized = assert_read_only_sql(sql)?;
+    let normalized_question = normalize_for_search(question);
+    let asks_for_revenue = ["arbevetel", "bevetel", "forgalom", "sales", "revenue"]
+        .iter()
+        .any(|term| normalized_question.contains(term));
+    let lower = normalized.to_lowercase();
+    let uses_invoice_data = Regex::new(r"(?i)\b(invoice|invoiceline)\b")
+        .expect("valid invoice table regex")
+        .is_match(&normalized);
+
+    if asks_for_revenue && uses_invoice_data {
+        if !lower.contains("itemsumbase") && !lower.contains("linepricebase") {
+            return Err(
+                "Árbevételhez nettó számlaértéket kell használni: invoice.itemsumbase vagy tételszinten invoiceline.linepricebase. A vatbase áfaösszeg, nem árbevétel."
+                    .into(),
+            );
+        }
+        if !Regex::new(r"(?i)\b(?:[a-z_]\w*\.)?companynumber\s*=\s*'1'")
+            .expect("valid company filter regex")
+            .is_match(&normalized)
+        {
+            return Err(
+                "A Trans Europe Zrt. árbevételéhez kötelező a companynumber = '1' szűrés.".into(),
+            );
+        }
+        if !Regex::new(r"(?i)\b(?:[a-z_]\w*\.)?posted\s*=\s*1\b")
+            .expect("valid posted filter regex")
+            .is_match(&normalized)
+        {
+            return Err("Árbevételhez csak a posted = 1 könyvelt számlák használhatók.".into());
+        }
+        if !lower.contains("debitcredit") {
+            return Err(
+                "Az árbevételben a debitcredit mező alapján le kell vonni a jóváírásokat.".into(),
+            );
+        }
+    }
+
+    Ok(normalized)
+}
+
 fn mysql_value_to_json(value: Option<&Value>) -> JsonValue {
     match value {
         None | Some(Value::NULL) => JsonValue::Null,
@@ -1578,6 +1620,14 @@ Kizárólag egy SELECT vagy WITH lekérdezést adhatsz. Tilos minden adatmódos�
 Az sql mező pontosan egyetlen SELECT vagy WITH utasítást tartalmazzon, záró pontosvessző nélkül. Ne használj SET, DECLARE, ideiglenes táblát vagy tárolt eljárást.
 Ne találj ki táblát vagy oszlopot. Használj explicit oszlopokat és aggregálj SQL-ben. A sorok száma legfeljebb 200 legyen.
 Az üzleti kategóriát és a táblaleírást tekintsd mérvadónak; az azonos szavakat tartalmazó, de más üzleti célú táblákat ne keverd össze.
+Kötelező árbevétel-definíció számlaadatok használatakor:
+- az árbevétel nettó számlázott árbevételt jelent a Trans Europe Zrt. vállalati alapdevizájában;
+- a Trans Europe Zrt. rekordjait companynumber = '1' azonosítja;
+- csak a posted = 1 könyvelt számlákat használd;
+- számlafejes összesítéshez invoice.itemsumbase mezőt használj, és a debitcredit = 1 jóváírásokat vond le;
+- cikkszintű elemzéshez invoiceline.linepricebase mezőt használj, az invoice táblához companynumber és invoicenumber alapján kapcsolva, hogy a könyveltséget és a jóváírás előjelét alkalmazhasd;
+- a vatbase áfaösszeg, soha ne nevezd vagy összegezd árbevételként;
+- eltérő invoice.currency értékeket ne add össze dokumentumdevizában; összehasonlításhoz a *base mezőket használd.
 Időfüggő üzleti adatoknál kötelező közvetlenül az SQL WHERE feltételében időszakot szűrni:
 - ha a kérdés napot vagy időszakot ad meg (például ma, tegnap, adott hónap), pontosan arra, és ne olvass be azon kívüli rekordot;
 - a beállított elemzési időablak {analysis_fy_window} FY; ennek kezdete {fiscal_year_start};
@@ -1597,11 +1647,11 @@ Kizárólag JSON objektummal válaszolj ebben az alakban:
     let planner_call = call_ai(&settings, &api_key, &planner_system, &planner_user, true).await?;
     let mut planner_usage = planner_call.usage;
     let mut plan: QueryPlan = extract_json(&planner_call.content)?;
-    plan.sql = match assert_read_only_sql(&plan.sql) {
+    plan.sql = match validate_planned_sql(question.trim(), &plan.sql) {
         Ok(sql) => sql,
         Err(first_error) => {
             let repair_user = format!(
-                r#"Az előző lekérdezési terv biztonsági ellenőrzése sikertelen volt.
+                r#"Az előző lekérdezési terv biztonsági vagy üzleti ellenőrzése sikertelen volt.
 Hiba: {first_error}
 
 Hibás SQL:
@@ -1619,9 +1669,9 @@ Javítsd ki a tervet. A JSON sql mezője pontosan egyetlen, záró pontosvessző
             planner_usage.add(&repaired_call.usage);
             let repaired_plan: QueryPlan = extract_json(&repaired_call.content)?;
             plan = repaired_plan;
-            assert_read_only_sql(&plan.sql).map_err(|second_error| {
+            validate_planned_sql(question.trim(), &plan.sql).map_err(|second_error| {
                 format!(
-                    "Az AI két próbálkozás után sem adott biztonságos, egyetlen SELECT lekérdezést: {second_error}"
+                    "Az AI két próbálkozás után sem adott biztonságos és üzletileg érvényes SELECT lekérdezést: {second_error}"
                 )
             })?
         }
@@ -1689,7 +1739,8 @@ mod tests {
         assert_read_only_sql, capability_answer, extract_json, fixed_quick_plan, is_chat_model,
         percent_encode_mailto, responses_input, run_query, schema_search_terms,
         select_schema_context, table_business_metadata, validate_analysis_fy_window,
-        validate_model, CatalogColumn, QueryPlan, SchemaCatalog, SchemaTable, StoredSettings,
+        validate_model, validate_planned_sql, CatalogColumn, QueryPlan, SchemaCatalog, SchemaTable,
+        StoredSettings,
     };
 
     #[test]
@@ -1757,6 +1808,35 @@ mod tests {
     }
 
     #[test]
+    fn fixed_revenue_queries_use_the_validated_business_definition() {
+        for quick_analysis in ["revenue-trend", "top-customers"] {
+            let sql = fixed_quick_plan(quick_analysis, 3).unwrap().sql;
+            let lower = sql.to_lowercase();
+            assert!(lower.contains("itemsumbase"));
+            assert!(lower.contains("companynumber = '1'"));
+            assert!(lower.contains("posted = 1"));
+            assert!(lower.contains("debitcredit"));
+            assert!(!lower.contains("vatbase"));
+            assert!(!lower.contains("invoiceline"));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_revenue_semantics_in_ai_plans() {
+        assert!(validate_planned_sql(
+            "Mennyi az árbevétel?",
+            "SELECT SUM(vatbase) FROM invoiceline"
+        )
+        .is_err());
+        assert!(validate_planned_sql(
+            "Mennyi az árbevétel?",
+            "SELECT SUM(CASE WHEN debitcredit = 0 THEN itemsumbase ELSE -itemsumbase END) FROM invoice WHERE companynumber = '1' AND posted = 1"
+        )
+        .is_ok());
+        assert!(validate_planned_sql("Hány ügyfél van?", "SELECT COUNT(*) FROM customer").is_ok());
+    }
+
+    #[test]
     #[ignore = "VPN-t és helyi .env fájlt igényel"]
     fn live_fixed_quick_queries_return_rows() {
         let env_path = std::env::var("ERGO_ENV_PATH").expect("ERGO_ENV_PATH is required");
@@ -1776,6 +1856,21 @@ mod tests {
                     .await
                     .unwrap_or_else(|error| panic!("{quick_analysis} failed: {error}"));
                 assert!(!rows.is_empty(), "{quick_analysis} returned no rows");
+                if quick_analysis == "revenue-trend" {
+                    let first = rows[0].as_object().expect("row must be an object");
+                    assert!(first.contains_key("netto_szamlazott_arbevetel"));
+                }
+                if quick_analysis == "top-customers" {
+                    let first = rows[0].as_object().expect("row must be an object");
+                    assert_eq!(
+                        first
+                            .get("ugyfelszam")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_lowercase),
+                        Some("basis".into())
+                    );
+                    assert!(first.contains_key("netto_szamlazott_arbevetel"));
+                }
                 if quick_analysis == "overdue-receivables" {
                     let first = rows[0].as_object().expect("row must be an object");
                     assert!(first.contains_key("szamlaszam"));
