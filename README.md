@@ -71,6 +71,13 @@ számlafej vállalati alapdevizás nettó értékéből, a jóváírások levon�
 dinamikus lekérdezések ellenőrzése ugyanezeket a szabályokat kényszeríti ki;
 az áfaösszeg (`vatbase`) nem használható árbevételként.
 
+A vevői vásárlások relációs skillje külön kezeli a számlázott partnert és a
+végfelhasználót. Az ilyen kérdéseknél az alkalmazás a `customer`, `endcustomer`,
+`invoice` és `invoiceline` kapcsolatát is vizsgálja, majd a jóváírásokkal
+korrigált mennyiséget és nettó alapdevizás sorértéket adja vissza. Az OBH
+ellenőrzött végfelhasználói aliasaihoz rögzített SQL-terv tartozik, így ennél a
+kérdésnél csak a szöveges összefoglaló használ AI-tokeneket.
+
 Az alkalmazás nem küldi el a teljes adatbázissémát minden kérdéssel. A táblák,
 oszlopok és idegen kulcsok katalógusát 24 órára helyben gyorsítótárazza, majd a
 magyar üzleti kérdés alapján legfeljebb 8 releváns táblát és táblánként 36

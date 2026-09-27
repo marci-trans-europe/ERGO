@@ -194,6 +194,26 @@ fn fixed_quick_plan(quick_analysis: &str, analysis_fy_window: u8) -> Result<Quer
     }
 }
 
+fn fixed_relationship_plan(question: &str, analysis_fy_window: u8) -> Option<QueryPlan> {
+    let normalized = normalize_for_search(question);
+    let is_obh = normalized.contains("obh") || normalized.contains("orszagos birosagi hivatal");
+    if !is_obh || !is_customer_purchase_question(question) {
+        return None;
+    }
+    let fiscal_year_start = format!(
+        "MAKEDATE(YEAR(CURRENT_DATE) - {}, 1)",
+        analysis_fy_window - 1
+    );
+    Some(QueryPlan {
+        sql: format!(
+            "SELECT i.customernumber AS szamlazott_partner_kod, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', c.name1, c.name2, c.name3, c.name4, c.name5)), ''), i.customernumber) AS szamlazott_partner, COALESCE(NULLIF(i.endcustomernumber, ''), il.endcustomernumber) AS vegfelhasznalo_kod, il.itemnumber AS cikkszam, COALESCE(NULLIF(il.itemtext1, ''), NULLIF(il.externalitemtext, ''), '(nincs megnevezés)') AS cikk, ROUND(SUM(CASE WHEN i.debitcredit = 0 THEN COALESCE(il.numberinvoiced, 0) ELSE -COALESCE(NULLIF(il.numbercredited, 0), il.numberinvoiced, 0) END), 2) AS mennyiseg, ROUND(SUM(CASE WHEN i.debitcredit = 0 THEN COALESCE(il.linepricebase, 0) ELSE -COALESCE(il.linepricebase, 0) END), 2) AS netto_ertek_alapdevizaban, COUNT(DISTINCT i.invoicenumber) AS szamlak_szama, DATE_FORMAT(MIN(STR_TO_DATE(i.invoicedate, '%Y.%m.%d')), '%Y-%m-%d') AS elso_szamla, DATE_FORMAT(MAX(STR_TO_DATE(i.invoicedate, '%Y.%m.%d')), '%Y-%m-%d') AS utolso_szamla FROM invoice i JOIN invoiceline il ON il.companynumber = i.companynumber AND il.invoicenumber = i.invoicenumber LEFT JOIN customer c ON c.customernumber = i.customernumber WHERE i.companynumber = '1' AND i.posted = 1 AND STR_TO_DATE(i.invoicedate, '%Y.%m.%d') >= {fiscal_year_start} AND STR_TO_DATE(i.invoicedate, '%Y.%m.%d') <= CURRENT_DATE AND (i.endcustomernumber IN ('birosag', 'orszagosbirosagi') OR il.endcustomernumber IN ('birosag', 'orszagosbirosagi')) GROUP BY i.customernumber, c.name1, c.name2, c.name3, c.name4, c.name5, COALESCE(NULLIF(i.endcustomernumber, ''), il.endcustomernumber), il.itemnumber, il.itemtext1, il.externalitemtext HAVING ABS(SUM(CASE WHEN i.debitcredit = 0 THEN COALESCE(il.linepricebase, 0) ELSE -COALESCE(il.linepricebase, 0) END)) > 0.004 OR ABS(SUM(CASE WHEN i.debitcredit = 0 THEN COALESCE(il.numberinvoiced, 0) ELSE -COALESCE(NULLIF(il.numbercredited, 0), il.numberinvoiced, 0) END)) > 0.004 ORDER BY netto_ertek_alapdevizaban DESC LIMIT 200"
+        ),
+        title: format!("Az OBH vásárolt cikkei az elmúlt {analysis_fy_window} FY-ban"),
+        visualization: "table".into(),
+        max_rows: 200,
+    })
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SchemaCatalog {
@@ -795,6 +815,48 @@ Az adatokat nem módosítom. A lekérdezéseket a kérdésben megadott időszakr
     )
 }
 
+fn is_customer_purchase_question(question: &str) -> bool {
+    let normalized = normalize_for_search(question);
+    [
+        "mit vasarolt",
+        "miket vasarolt",
+        "milyen cikkeket",
+        "milyen termekeket",
+        "mit rendelt",
+        "miket rendelt",
+        "mit vett",
+        "miket vett",
+        "beszerzett cikk",
+        "beszerzett termek",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase))
+}
+
+fn business_relationship_skill(question: &str) -> &'static str {
+    if !is_customer_purchase_question(question) {
+        return "";
+    }
+
+    let normalized = normalize_for_search(question);
+    if normalized.contains("obh") || normalized.contains("orszagos birosagi hivatal") {
+        return r#"Aktív üzleti relációs skill — vevői vásárlások és OBH:
+- A számlázott partner és a tényleges végfelhasználó eltérhet. Mindkét relációt vizsgáld meg.
+- Kimenő értékesítési lánc: invoice -> invoiceline a companynumber + invoicenumber mezőkön; invoice.customernumber -> customer.customernumber; invoice.endcustomernumber vagy invoiceline.endcustomernumber -> endcustomer.endcustomernumber.
+- Szervezetet a customer és endcustomer name1..name5 mezőiben, továbbá a számlafej név-pillanatképében keress. Ne feltételezd, hogy a rövidítés az adatbázisbeli kód.
+- Az „OBH” az Országos Bírósági Hivatalt jelenti. Ellenőrzött végfelhasználói kódjai: 'birosag' és 'orszagosbirosagi'. Az 'obh' kód NEM az Országos Bírósági Hivatal, hanem az Országgyűlési Biztosok Hivatalának régi rekordja; ezt ne használd OBH-találatként.
+- A találatokban mutasd meg a számlázott partnert, a végfelhasználót, a számlaszámot és dátumot, a cikkszámot, megnevezést, előjeles mennyiséget és előjeles nettó linepricebase értéket.
+- Csak companynumber = '1' és posted = 1 számlákat használj; debitcredit = 1 esetén a jóváírást vond le."#;
+    }
+
+    r#"Aktív üzleti relációs skill — vevői vásárlások:
+- A számlázott partner és a tényleges végfelhasználó eltérhet. Mindkét relációt vizsgáld meg.
+- Kimenő értékesítési lánc: invoice -> invoiceline a companynumber + invoicenumber mezőkön; invoice.customernumber -> customer.customernumber; invoice.endcustomernumber vagy invoiceline.endcustomernumber -> endcustomer.endcustomernumber.
+- A kérdésben szereplő szervezetet a customer és endcustomer name1..name5 mezőiben, továbbá a számlafej név-pillanatképében keresd. Ne feltételezd, hogy a rövidítés az adatbázisbeli kód.
+- A találatokban mutasd meg a számlázott partnert, a végfelhasználót, a számlaszámot és dátumot, a cikkszámot, megnevezést, előjeles mennyiséget és előjeles nettó linepricebase értéket.
+- Csak companynumber = '1' és posted = 1 számlákat használj; debitcredit = 1 esetén a jóváírást vond le."#
+}
+
 fn schema_search_terms(question: &str, history: &[HistoryMessage]) -> HashSet<String> {
     let stop_words = [
         "adat", "adatok", "alapjan", "az", "egy", "es", "hogy", "kerlek", "legyen", "meg", "mely",
@@ -902,6 +964,31 @@ fn schema_search_terms(question: &str, history: &[HistoryMessage]) -> HashSet<St
             terms.extend(expansions.iter().map(|term| (*term).to_string()));
         }
     }
+    if is_customer_purchase_question(&search_text.join(" ")) {
+        terms.extend(
+            [
+                "invoice",
+                "invoiceline",
+                "customer",
+                "endcustomer",
+                "name",
+                "customernumber",
+                "endcustomernumber",
+                "invoicenumber",
+                "invoicedate",
+                "itemnumber",
+                "itemtext",
+                "numberinvoiced",
+                "numbercredited",
+                "linepricebase",
+                "debitcredit",
+                "posted",
+                "companynumber",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+    }
     terms
 }
 
@@ -925,7 +1012,10 @@ fn table_business_metadata(table_name: &str) -> (&'static str, Option<&'static s
         "deliverynote" => Some("szállítólevelek fejléce"),
         "deliverynoteline" => Some("szállítólevelek tételsorai"),
         "financeentry" => Some("főkönyvi könyvelési tételek"),
-        "customer" | "companycustomer" => Some("vevői törzsadatok"),
+        "customer" | "companycustomer" => Some("közvetlen, számlázott vevői törzsadatok"),
+        "endcustomer" => Some(
+            "végfelhasználói törzsadatok; a tényleges felhasználó eltérhet a számlázott vevőtől",
+        ),
         "vendor" | "companyvendor" => Some("szállítói törzsadatok"),
         _ => None,
     };
@@ -1042,6 +1132,7 @@ fn select_schema_context(
         "date",
         "debit",
         "due",
+        "endcustomer",
         "invoice",
         "item",
         "job",
@@ -1053,6 +1144,7 @@ fn select_schema_context(
         "paid",
         "payment",
         "price",
+        "posted",
         "quantity",
         "remainder",
         "status",
@@ -1238,6 +1330,56 @@ fn validate_planned_sql(question: &str, sql: &str) -> Result<String, String> {
         if !lower.contains("debitcredit") {
             return Err(
                 "Az árbevételben a debitcredit mező alapján le kell vonni a jóváírásokat.".into(),
+            );
+        }
+    }
+
+    if is_customer_purchase_question(question) {
+        if !Regex::new(r"(?i)\binvoice\b")
+            .expect("valid invoice regex")
+            .is_match(&normalized)
+            || !Regex::new(r"(?i)\binvoiceline\b")
+                .expect("valid invoice line regex")
+                .is_match(&normalized)
+        {
+            return Err(
+                "Vevői vásárlásokhoz az invoice számlafejet és az invoiceline cikksorokat együtt kell használni."
+                    .into(),
+            );
+        }
+        if !lower.contains("endcustomernumber") {
+            return Err(
+                "A számlázott vevő eltérhet a végfelhasználótól: a vásárlási lekérdezésnek az invoice vagy invoiceline endcustomernumber relációját is vizsgálnia kell."
+                    .into(),
+            );
+        }
+        if !Regex::new(r"(?i)\b(?:[a-z_]\w*\.)?companynumber\s*=\s*'1'")
+            .expect("valid company filter regex")
+            .is_match(&normalized)
+        {
+            return Err(
+                "Vevői vásárlásokhoz kötelező a Trans Europe Zrt. companynumber = '1' szűrése."
+                    .into(),
+            );
+        }
+        if !Regex::new(r"(?i)\b(?:[a-z_]\w*\.)?posted\s*=\s*1\b")
+            .expect("valid posted filter regex")
+            .is_match(&normalized)
+        {
+            return Err(
+                "Vevői vásárlásokhoz csak posted = 1 könyvelt számlák használhatók.".into(),
+            );
+        }
+        if !lower.contains("debitcredit") {
+            return Err(
+                "A vásárlási mennyiségekben és értékekben a debitcredit mező alapján kezelni kell a jóváírásokat."
+                    .into(),
+            );
+        }
+        if !lower.contains("linepricebase") {
+            return Err(
+                "A vásárolt cikksorok összehasonlítható nettó értékéhez az invoiceline.linepricebase mezőt kell használni."
+                    .into(),
             );
         }
     }
@@ -1589,6 +1731,44 @@ async fn analyze_erp(
         "MySQL-jelszó",
     )?;
     let api_key = read_secret(&app, "AI_API_KEY", AI_API_KEY_ACCOUNT, "AI API-kulcs")?;
+    let analysis_fy_window = validate_analysis_fy_window(settings.analysis_fy_window)?;
+    if let Some(plan) = fixed_relationship_plan(question.trim(), analysis_fy_window) {
+        let sql = validate_planned_sql(question.trim(), &plan.sql)?;
+        let (columns, rows, truncated) =
+            run_query(&settings, mysql_password, &sql, plan.max_rows).await?;
+        let summary_call = summarize_query_result(
+            &settings,
+            &api_key,
+            question.trim(),
+            &rows,
+            truncated,
+            analysis_fy_window,
+        )
+        .await?;
+        let row_count = rows.len();
+        return Ok(AnalyzeResponse {
+            summary: summary_call.content,
+            result: Some(QueryResult {
+                kind: "query-result",
+                title: plan.title,
+                visualization: plan.visualization,
+                columns,
+                rows,
+                row_count,
+                truncated,
+                sql,
+                query_source: "fixed",
+                token_usage: summary_call.usage,
+                schema_selection: SchemaSelectionStats {
+                    total_tables: 0,
+                    total_columns: 0,
+                    selected_tables: 0,
+                    selected_columns: 0,
+                    context_characters: 0,
+                },
+            }),
+        });
+    }
     let catalog = load_schema_catalog(&app, &settings, mysql_password.clone()).await?;
     let (schema_context, schema_selection) =
         select_schema_context(&catalog, question.trim(), &history);
@@ -1608,11 +1788,11 @@ async fn analyze_erp(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let analysis_fy_window = validate_analysis_fy_window(settings.analysis_fy_window)?;
     let fiscal_year_start = format!(
         "MAKEDATE(YEAR(CURRENT_DATE) - {}, 1)",
         analysis_fy_window - 1
     );
+    let relationship_skill = business_relationship_skill(question.trim());
     let planner_system = format!(
         r#"Te az ERGO, a Trans-Europe óvatos ERP-adatelemzője vagy.
 Készíts pontos MySQL lekérdezési tervet a megadott adatbázis-séma alapján.
@@ -1635,6 +1815,8 @@ Időfüggő üzleti adatoknál kötelező közvetlenül az SQL WHERE feltételé
 - a beállított {analysis_fy_window} FY időablaknál régebbi tranzakciót akkor se használj, ha a felhasználó tágabb időszakot kér;
 - dátumként tárolt varchar mezőnél vedd figyelembe a sémában jelzett típust és a ponttal tagolt YYYY.MM.DD formátumot;
 - fejlécszámhoz ne kapcsolj tételtáblát, ha a kérdés nem kér tételszintű adatot.
+
+{relationship_skill}
 Kizárólag JSON objektummal válaszolj ebben az alakban:
 {{"sql":"...","title":"rövid magyar cím","visualization":"table|bar|line","maxRows":50}}
 
@@ -1736,11 +1918,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_read_only_sql, capability_answer, extract_json, fixed_quick_plan, is_chat_model,
-        percent_encode_mailto, responses_input, run_query, schema_search_terms,
-        select_schema_context, table_business_metadata, validate_analysis_fy_window,
-        validate_model, validate_planned_sql, CatalogColumn, QueryPlan, SchemaCatalog, SchemaTable,
-        StoredSettings,
+        assert_read_only_sql, business_relationship_skill, capability_answer, extract_json,
+        fixed_quick_plan, fixed_relationship_plan, is_chat_model, percent_encode_mailto,
+        responses_input, run_query, schema_search_terms, select_schema_context,
+        table_business_metadata, validate_analysis_fy_window, validate_model, validate_planned_sql,
+        CatalogColumn, JsonValue, QueryPlan, SchemaCatalog, SchemaTable, StoredSettings,
     };
 
     #[test]
@@ -1837,6 +2019,48 @@ mod tests {
     }
 
     #[test]
+    fn customer_purchase_questions_require_end_customer_relations() {
+        let question = "Miket vásárolt az Országos Bírósági Hivatal az elmúlt 3 évben?";
+        assert!(validate_planned_sql(
+            question,
+            "SELECT il.itemnumber FROM invoice i JOIN invoiceline il ON il.invoicenumber = i.invoicenumber WHERE i.customernumber = 'obh' AND i.companynumber = '1' AND i.posted = 1"
+        )
+        .is_err());
+        assert!(validate_planned_sql(
+            question,
+            "SELECT il.itemnumber, CASE WHEN i.debitcredit = 0 THEN il.linepricebase ELSE -il.linepricebase END AS netto FROM invoice i JOIN invoiceline il ON il.companynumber = i.companynumber AND il.invoicenumber = i.invoicenumber LEFT JOIN endcustomer ec ON ec.endcustomernumber = COALESCE(i.endcustomernumber, il.endcustomernumber) WHERE i.companynumber = '1' AND i.posted = 1 AND i.endcustomernumber IN ('birosag', 'orszagosbirosagi')"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn obh_purchase_question_has_a_fixed_relationship_plan() {
+        let plan = fixed_relationship_plan(
+            "Miket vásárolt az Országos Bírósági Hivatal az elmúlt 3 évben?",
+            3,
+        )
+        .expect("OBH purchase questions must have a fixed plan");
+        assert!(plan.sql.contains("'birosag', 'orszagosbirosagi'"));
+        assert!(plan.sql.contains("invoice i JOIN invoiceline il"));
+        assert!(plan.sql.contains("i.companynumber = '1'"));
+        assert!(plan.sql.contains("i.posted = 1"));
+        assert!(plan.sql.contains("i.debitcredit"));
+        assert!(plan.sql.contains("il.linepricebase"));
+        assert!(fixed_relationship_plan("Miket vásárolt a Designshop?", 3).is_none());
+    }
+
+    #[test]
+    fn obh_relationship_skill_disambiguates_the_legacy_code() {
+        let skill = business_relationship_skill(
+            "Miket vásárolt az Országos Bírósági Hivatal az elmúlt 3 évben?",
+        );
+        assert!(skill.contains("invoice.endcustomernumber"));
+        assert!(skill.contains("'birosag'"));
+        assert!(skill.contains("'orszagosbirosagi'"));
+        assert!(skill.contains("NEM az Országos Bírósági Hivatal"));
+    }
+
+    #[test]
     #[ignore = "VPN-t és helyi .env fájlt igényel"]
     fn live_fixed_quick_queries_return_rows() {
         let env_path = std::env::var("ERGO_ENV_PATH").expect("ERGO_ENV_PATH is required");
@@ -1882,6 +2106,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "VPN-t és helyi .env fájlt igényel"]
+    fn live_obh_end_customer_relationship_returns_invoice_items() {
+        let env_path = std::env::var("ERGO_ENV_PATH").expect("ERGO_ENV_PATH is required");
+        let contents = std::fs::read_to_string(env_path).expect("the .env file must be readable");
+        let password = contents
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("MYSQL_PASSWORD="))
+            .map(|value| value.trim().trim_matches(['\'', '"']).to_string())
+            .filter(|value| !value.is_empty())
+            .expect("MYSQL_PASSWORD must be present");
+        let plan = fixed_relationship_plan(
+            "Miket vásárolt az Országos Bírósági Hivatal az elmúlt 3 évben?",
+            3,
+        )
+        .expect("OBH purchase questions must have a fixed plan");
+
+        tauri::async_runtime::block_on(async {
+            let settings = StoredSettings::default();
+            let (_, rows, truncated) = run_query(&settings, password, &plan.sql, plan.max_rows)
+                .await
+                .expect("the OBH relationship query must succeed");
+            assert!(!rows.is_empty(), "the OBH relationship returned no rows");
+            assert!(!truncated);
+            assert!(rows.iter().any(|row| {
+                row.get("cikkszam").and_then(JsonValue::as_str) == Some("360-TEAM")
+            }));
+        });
+    }
+
+    #[test]
     fn encodes_feedback_for_a_mailto_url() {
         assert_eq!(
             percent_encode_mailto("Hiba és kérdés"),
@@ -1895,6 +2149,21 @@ mod tests {
         assert!(terms.contains("customerentry"));
         assert!(terms.contains("duedate"));
         assert!(terms.contains("remainder"));
+
+        let purchase_terms = schema_search_terms(
+            "Miket vásárolt az Országos Bírósági Hivatal az elmúlt 3 évben?",
+            &[],
+        );
+        for expected in [
+            "invoice",
+            "invoiceline",
+            "customer",
+            "endcustomer",
+            "endcustomernumber",
+            "linepricebase",
+        ] {
+            assert!(purchase_terms.contains(expected), "missing {expected}");
+        }
     }
 
     #[test]
