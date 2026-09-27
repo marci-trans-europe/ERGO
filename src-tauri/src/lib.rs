@@ -194,24 +194,41 @@ fn fixed_quick_plan(quick_analysis: &str, analysis_fy_window: u8) -> Result<Quer
     }
 }
 
+fn end_customer_purchase_plan(
+    label: &str,
+    end_customer_codes: &[String],
+    analysis_fy_window: u8,
+) -> QueryPlan {
+    let quoted_codes = end_customer_codes
+        .iter()
+        .map(|code| format!("'{}'", code.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fiscal_year_start = format!(
+        "MAKEDATE(YEAR(CURRENT_DATE) - {}, 1)",
+        analysis_fy_window - 1
+    );
+    QueryPlan {
+        sql: format!(
+            "SELECT i.customernumber AS szamlazott_partner_kod, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', c.name1, c.name2, c.name3, c.name4, c.name5)), ''), i.customernumber) AS szamlazott_partner, COALESCE(NULLIF(i.endcustomernumber, ''), il.endcustomernumber) AS vegfelhasznalo_kod, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', ec.name1, ec.name2, ec.name3, ec.name4, ec.name5)), ''), COALESCE(NULLIF(i.endcustomernumber, ''), il.endcustomernumber)) AS vegfelhasznalo, il.itemnumber AS cikkszam, COALESCE(NULLIF(il.itemtext1, ''), NULLIF(il.externalitemtext, ''), '(nincs megnevezés)') AS cikk, ROUND(SUM(CASE WHEN i.debitcredit = 0 THEN COALESCE(il.numberinvoiced, 0) ELSE -COALESCE(NULLIF(il.numbercredited, 0), il.numberinvoiced, 0) END), 2) AS mennyiseg, ROUND(SUM(CASE WHEN i.debitcredit = 0 THEN COALESCE(il.linepricebase, 0) ELSE -COALESCE(il.linepricebase, 0) END), 2) AS netto_ertek_alapdevizaban, COUNT(DISTINCT i.invoicenumber) AS szamlak_szama, DATE_FORMAT(MIN(STR_TO_DATE(i.invoicedate, '%Y.%m.%d')), '%Y-%m-%d') AS elso_szamla, DATE_FORMAT(MAX(STR_TO_DATE(i.invoicedate, '%Y.%m.%d')), '%Y-%m-%d') AS utolso_szamla FROM invoice i JOIN invoiceline il ON il.companynumber = i.companynumber AND il.invoicenumber = i.invoicenumber LEFT JOIN customer c ON c.customernumber = i.customernumber LEFT JOIN endcustomer ec ON ec.endcustomernumber = COALESCE(NULLIF(i.endcustomernumber, ''), il.endcustomernumber) WHERE i.companynumber = '1' AND i.posted = 1 AND STR_TO_DATE(i.invoicedate, '%Y.%m.%d') >= {fiscal_year_start} AND STR_TO_DATE(i.invoicedate, '%Y.%m.%d') <= CURRENT_DATE AND (i.endcustomernumber IN ({quoted_codes}) OR il.endcustomernumber IN ({quoted_codes})) GROUP BY i.customernumber, c.name1, c.name2, c.name3, c.name4, c.name5, i.endcustomernumber, il.endcustomernumber, ec.name1, ec.name2, ec.name3, ec.name4, ec.name5, il.itemnumber, il.itemtext1, il.externalitemtext HAVING ABS(SUM(CASE WHEN i.debitcredit = 0 THEN COALESCE(il.linepricebase, 0) ELSE -COALESCE(il.linepricebase, 0) END)) > 0.004 OR ABS(SUM(CASE WHEN i.debitcredit = 0 THEN COALESCE(il.numberinvoiced, 0) ELSE -COALESCE(NULLIF(il.numbercredited, 0), il.numberinvoiced, 0) END)) > 0.004 ORDER BY netto_ertek_alapdevizaban DESC LIMIT 200"
+        ),
+        title: format!("{label} vásárolt cikkei az elmúlt {analysis_fy_window} FY-ban"),
+        visualization: "table".into(),
+        max_rows: 200,
+    }
+}
+
 fn fixed_relationship_plan(question: &str, analysis_fy_window: u8) -> Option<QueryPlan> {
     let normalized = normalize_for_search(question);
     let is_obh = normalized.contains("obh") || normalized.contains("orszagos birosagi hivatal");
     if !is_obh || !is_customer_purchase_question(question) {
         return None;
     }
-    let fiscal_year_start = format!(
-        "MAKEDATE(YEAR(CURRENT_DATE) - {}, 1)",
-        analysis_fy_window - 1
-    );
-    Some(QueryPlan {
-        sql: format!(
-            "SELECT i.customernumber AS szamlazott_partner_kod, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', c.name1, c.name2, c.name3, c.name4, c.name5)), ''), i.customernumber) AS szamlazott_partner, COALESCE(NULLIF(i.endcustomernumber, ''), il.endcustomernumber) AS vegfelhasznalo_kod, il.itemnumber AS cikkszam, COALESCE(NULLIF(il.itemtext1, ''), NULLIF(il.externalitemtext, ''), '(nincs megnevezés)') AS cikk, ROUND(SUM(CASE WHEN i.debitcredit = 0 THEN COALESCE(il.numberinvoiced, 0) ELSE -COALESCE(NULLIF(il.numbercredited, 0), il.numberinvoiced, 0) END), 2) AS mennyiseg, ROUND(SUM(CASE WHEN i.debitcredit = 0 THEN COALESCE(il.linepricebase, 0) ELSE -COALESCE(il.linepricebase, 0) END), 2) AS netto_ertek_alapdevizaban, COUNT(DISTINCT i.invoicenumber) AS szamlak_szama, DATE_FORMAT(MIN(STR_TO_DATE(i.invoicedate, '%Y.%m.%d')), '%Y-%m-%d') AS elso_szamla, DATE_FORMAT(MAX(STR_TO_DATE(i.invoicedate, '%Y.%m.%d')), '%Y-%m-%d') AS utolso_szamla FROM invoice i JOIN invoiceline il ON il.companynumber = i.companynumber AND il.invoicenumber = i.invoicenumber LEFT JOIN customer c ON c.customernumber = i.customernumber WHERE i.companynumber = '1' AND i.posted = 1 AND STR_TO_DATE(i.invoicedate, '%Y.%m.%d') >= {fiscal_year_start} AND STR_TO_DATE(i.invoicedate, '%Y.%m.%d') <= CURRENT_DATE AND (i.endcustomernumber IN ('birosag', 'orszagosbirosagi') OR il.endcustomernumber IN ('birosag', 'orszagosbirosagi')) GROUP BY i.customernumber, c.name1, c.name2, c.name3, c.name4, c.name5, COALESCE(NULLIF(i.endcustomernumber, ''), il.endcustomernumber), il.itemnumber, il.itemtext1, il.externalitemtext HAVING ABS(SUM(CASE WHEN i.debitcredit = 0 THEN COALESCE(il.linepricebase, 0) ELSE -COALESCE(il.linepricebase, 0) END)) > 0.004 OR ABS(SUM(CASE WHEN i.debitcredit = 0 THEN COALESCE(il.numberinvoiced, 0) ELSE -COALESCE(NULLIF(il.numbercredited, 0), il.numberinvoiced, 0) END)) > 0.004 ORDER BY netto_ertek_alapdevizaban DESC LIMIT 200"
-        ),
-        title: format!("Az OBH vásárolt cikkei az elmúlt {analysis_fy_window} FY-ban"),
-        visualization: "table".into(),
-        max_rows: 200,
-    })
+    Some(end_customer_purchase_plan(
+        "Az OBH",
+        &["birosag".into(), "orszagosbirosagi".into()],
+        analysis_fy_window,
+    ))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -831,6 +848,93 @@ fn is_customer_purchase_question(question: &str) -> bool {
     ]
     .iter()
     .any(|phrase| normalized.contains(phrase))
+}
+
+fn explicit_end_customer_name(question: &str) -> Option<String> {
+    let normalized = normalize_for_search(question);
+    if !is_customer_purchase_question(question) || !normalized.contains("vegfelhasznalo") {
+        return None;
+    }
+    let purchase_marker = ["vasarolt", "rendelt", "vett"]
+        .iter()
+        .filter_map(|marker| normalized.find(marker).map(|index| (index, *marker)))
+        .min_by_key(|(index, _)| *index)?;
+    let mut candidate = normalized[purchase_marker.0 + purchase_marker.1.len()..].trim();
+    candidate = candidate
+        .strip_prefix("az ")
+        .or_else(|| candidate.strip_prefix("a "))
+        .unwrap_or(candidate);
+    let candidate = candidate
+        .split("vegfelhasznalo")
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let safe = candidate
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || character.is_ascii_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (safe.len() >= 4).then_some(safe)
+}
+
+async fn resolve_end_customer(
+    settings: &StoredSettings,
+    password: String,
+    search_name: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let compact_search = search_name.replace(' ', "");
+    if compact_search.len() < 4
+        || !compact_search
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        return Ok(Vec::new());
+    }
+    let mut search_variants = vec![search_name.to_string()];
+    if search_name.contains("szoft") {
+        search_variants.push(search_name.replace("szoft", "soft"));
+    }
+    if search_name.contains("soft") {
+        search_variants.push(search_name.replace("soft", "szoft"));
+    }
+    search_variants.sort();
+    search_variants.dedup();
+    let name_conditions = search_variants
+        .iter()
+        .map(|variant| {
+            let like_search = variant.split_whitespace().collect::<Vec<_>>().join("%");
+            format!(
+                "LOWER(endcustomernumber) = '{variant}' OR LOWER(CONCAT_WS(' ', name1, name2, name3, name4, name5)) LIKE '%{like_search}%'"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let exact_code_conditions = search_variants
+        .iter()
+        .map(|variant| format!("LOWER(endcustomernumber) = '{variant}'"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let sql = format!(
+        "SELECT endcustomernumber AS vegfelhasznalo_kod, COALESCE(NULLIF(TRIM(name1), ''), TRIM(CONCAT_WS(' ', name1, name2, name3, name4, name5))) AS vegfelhasznalo FROM endcustomer WHERE {name_conditions} ORDER BY CASE WHEN {exact_code_conditions} THEN 0 ELSE 1 END, endcustomernumber LIMIT 20"
+    );
+    let (_, rows, _) = run_query(settings, password, &sql, 20).await?;
+    let mut matches = rows
+        .into_iter()
+        .filter_map(|row| {
+            let code = row.get("vegfelhasznalo_kod")?.as_str()?.trim().to_string();
+            let name = row
+                .get("vegfelhasznalo")
+                .and_then(JsonValue::as_str)
+                .unwrap_or(&code)
+                .trim()
+                .to_string();
+            (!code.is_empty()).then_some((code, name))
+        })
+        .collect::<Vec<_>>();
+    matches.dedup_by(|left, right| left.0 == right.0);
+    Ok(matches)
 }
 
 fn business_relationship_skill(question: &str) -> &'static str {
@@ -1732,7 +1836,26 @@ async fn analyze_erp(
     )?;
     let api_key = read_secret(&app, "AI_API_KEY", AI_API_KEY_ACCOUNT, "AI API-kulcs")?;
     let analysis_fy_window = validate_analysis_fy_window(settings.analysis_fy_window)?;
-    if let Some(plan) = fixed_relationship_plan(question.trim(), analysis_fy_window) {
+    let mut relationship_plan = fixed_relationship_plan(question.trim(), analysis_fy_window);
+    if relationship_plan.is_none() {
+        if let Some(search_name) = explicit_end_customer_name(question.trim()) {
+            let matches =
+                resolve_end_customer(&settings, mysql_password.clone(), &search_name).await?;
+            if !matches.is_empty() {
+                let label = matches[0].1.clone();
+                let codes = matches
+                    .into_iter()
+                    .map(|(code, _)| code)
+                    .collect::<Vec<_>>();
+                relationship_plan = Some(end_customer_purchase_plan(
+                    &label,
+                    &codes,
+                    analysis_fy_window,
+                ));
+            }
+        }
+    }
+    if let Some(plan) = relationship_plan {
         let sql = validate_planned_sql(question.trim(), &plan.sql)?;
         let (columns, rows, truncated) =
             run_query(&settings, mysql_password, &sql, plan.max_rows).await?;
@@ -1918,8 +2041,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_read_only_sql, business_relationship_skill, capability_answer, extract_json,
-        fixed_quick_plan, fixed_relationship_plan, is_chat_model, percent_encode_mailto,
+        assert_read_only_sql, business_relationship_skill, capability_answer,
+        end_customer_purchase_plan, explicit_end_customer_name, extract_json, fixed_quick_plan,
+        fixed_relationship_plan, is_chat_model, percent_encode_mailto, resolve_end_customer,
         responses_input, run_query, schema_search_terms, select_schema_context,
         table_business_metadata, validate_analysis_fy_window, validate_model, validate_planned_sql,
         CatalogColumn, JsonValue, QueryPlan, SchemaCatalog, SchemaTable, StoredSettings,
@@ -2050,6 +2174,21 @@ mod tests {
     }
 
     #[test]
+    fn extracts_an_explicit_end_customer_from_purchase_questions() {
+        assert_eq!(
+            explicit_end_customer_name(
+                "Miket vásárolt az Idomszoft végfelhasználó az elmúlt 3 évben?"
+            ),
+            Some("idomszoft".into())
+        );
+        assert_eq!(
+            explicit_end_customer_name("Mit rendelt a Magyar Posta végfelhasználó?"),
+            Some("magyar posta".into())
+        );
+        assert!(explicit_end_customer_name("Miket vásárolt a Designshop?").is_none());
+    }
+
+    #[test]
     fn obh_relationship_skill_disambiguates_the_legacy_code() {
         let skill = business_relationship_skill(
             "Miket vásárolt az Országos Bírósági Hivatal az elmúlt 3 évben?",
@@ -2132,6 +2271,37 @@ mod tests {
             assert!(rows.iter().any(|row| {
                 row.get("cikkszam").and_then(JsonValue::as_str) == Some("360-TEAM")
             }));
+        });
+    }
+
+    #[test]
+    #[ignore = "VPN-t és helyi .env fájlt igényel"]
+    fn live_idomsoft_end_customer_resolution_returns_invoice_items() {
+        let env_path = std::env::var("ERGO_ENV_PATH").expect("ERGO_ENV_PATH is required");
+        let contents = std::fs::read_to_string(env_path).expect("the .env file must be readable");
+        let password = contents
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("MYSQL_PASSWORD="))
+            .map(|value| value.trim().trim_matches(['\'', '"']).to_string())
+            .filter(|value| !value.is_empty())
+            .expect("MYSQL_PASSWORD must be present");
+
+        tauri::async_runtime::block_on(async {
+            let settings = StoredSettings::default();
+            let matches = resolve_end_customer(&settings, password.clone(), "idomszoft")
+                .await
+                .expect("IdomSoft resolution must succeed");
+            assert!(!matches.is_empty(), "IdomSoft was not resolved");
+            let label = matches[0].1.clone();
+            let codes = matches
+                .into_iter()
+                .map(|(code, _)| code)
+                .collect::<Vec<_>>();
+            let plan = end_customer_purchase_plan(&label, &codes, 3);
+            let (_, rows, _) = run_query(&settings, password, &plan.sql, plan.max_rows)
+                .await
+                .expect("IdomSoft item query must succeed");
+            assert!(!rows.is_empty(), "IdomSoft item query returned no rows");
         });
     }
 

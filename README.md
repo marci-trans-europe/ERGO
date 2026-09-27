@@ -78,6 +78,13 @@ korrigált mennyiséget és nettó alapdevizás sorértéket adja vissza. Az OBH
 ellenőrzött végfelhasználói aliasaihoz rögzített SQL-terv tartozik, így ennél a
 kérdésnél csak a szöveges összefoglaló használ AI-tokeneket.
 
+Az „X végfelhasználó mit vásárolt?” megfogalmazást az ERGO általánosan
+felismeri: az `endcustomer` törzsben helyben feloldja a szervezet nevét és
+aliasait — többek között a „szoft” és „soft” írásváltozatokat —, majd ugyanazt
+az ellenőrzött számla–cikksor relációt használja. A hosszú lekérdezési
+eredmények tördelhető táblázatban jelennek meg, és egy gombbal teljes képernyős
+nézetre válthatók.
+
 Az alkalmazás nem küldi el a teljes adatbázissémát minden kérdéssel. A táblák,
 oszlopok és idegen kulcsok katalógusát 24 órára helyben gyorsítótárazza, majd a
 magyar üzleti kérdés alapján legfeljebb 8 releváns táblát és táblánként 36

@@ -801,6 +801,18 @@ button:disabled {
   box-shadow: 0 12px 36px rgba(40, 53, 49, 0.07);
 }
 
+.result-card--expanded {
+  position: fixed;
+  z-index: 1000;
+  inset: 14px;
+  display: grid;
+  min-width: 0;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  border-radius: 18px 6px 18px 6px;
+  background: var(--card);
+  box-shadow: 0 30px 100px rgba(11, 30, 26, 0.38);
+}
+
 .result-card > header {
   display: flex;
   align-items: flex-start;
@@ -853,10 +865,18 @@ button:disabled {
 .table-scroll {
   max-height: 390px;
   overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.result-card--expanded .table-scroll,
+.result-card--expanded .result-chart {
+  min-height: 0;
+  max-height: none;
 }
 
 .result-card table {
   width: 100%;
+  min-width: 1080px;
   border-collapse: collapse;
   font-size: 0.72rem;
 }
@@ -878,11 +898,36 @@ button:disabled {
 }
 
 .result-card td {
-  max-width: 290px;
   padding: 9px 12px;
   border-bottom: 1px solid #ecece8;
   color: #39433f;
+  line-height: 1.42;
+  vertical-align: top;
+}
+
+.result-card td.result-cell-compact {
+  width: 1%;
+  min-width: 112px;
   white-space: nowrap;
+}
+
+.result-card td.result-cell-text {
+  min-width: 150px;
+  max-width: 260px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.result-card td.result-cell-long {
+  min-width: 240px;
+  max-width: 520px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.result-card--expanded td.result-cell-long {
+  min-width: 300px;
+  max-width: 680px;
 }
 
 .result-card td.item-breakdown-cell {

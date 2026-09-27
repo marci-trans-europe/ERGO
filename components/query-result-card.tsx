@@ -1,7 +1,7 @@
 'use client'
 
-import { Braces, Download, Table2 } from 'lucide-react'
-import { useState } from 'react'
+import { Braces, Download, Maximize2, Minimize2, Table2 } from 'lucide-react'
+import { useEffect, useState } from 'react'
 
 import type { QueryResult, QueryRow, QueryValue } from '@/lib/types'
 
@@ -332,9 +332,20 @@ const ResultTable = ({
             {columns.map((column) => (
               <td
                 className={
-                  column === 'cikkek' ? 'item-breakdown-cell' : undefined
+                  column === 'cikkek'
+                    ? 'item-breakdown-cell'
+                    : /cikk|itemtext|description|megnevezes|megnevezés|partner|customer|ugyfel|ügyfél/i.test(
+                          column,
+                        )
+                      ? 'result-cell-long'
+                      : /datum|dátum|date|szamla|számla|mennyiseg|mennyiség|ertek|érték|amount|price|total|number|count/i.test(
+                            column,
+                          )
+                        ? 'result-cell-compact'
+                        : 'result-cell-text'
                 }
                 key={column}
+                title={displayValue(row[column], column)}
               >
                 {column === 'cikkek' && typeof row[column] === 'string' ? (
                   <ul className="item-breakdown">
@@ -357,11 +368,34 @@ const ResultTable = ({
 )
 
 export const QueryResultCard = ({ result }: QueryResultCardProps) => {
+  const [expanded, setExpanded] = useState(false)
   const hasChart =
     result.visualization !== 'table' && Boolean(findChartColumns(result))
 
+  useEffect(() => {
+    if (!expanded) return
+
+    const previousOverflow = document.body.style.overflow
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setExpanded(false)
+    }
+    document.body.style.overflow = 'hidden'
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [expanded])
+
   return (
-    <section className="result-card">
+    <section
+      aria-label={
+        expanded ? `${result.title} teljes képernyős nézete` : undefined
+      }
+      aria-modal={expanded || undefined}
+      className={`result-card${expanded ? ' result-card--expanded' : ''}`}
+      role={expanded ? 'dialog' : undefined}
+    >
       <header>
         <div>
           <p className="result-kicker">
@@ -371,6 +405,27 @@ export const QueryResultCard = ({ result }: QueryResultCardProps) => {
         </div>
         <div className="result-actions">
           <span>{result.rowCount} sor</span>
+          <button
+            aria-label={
+              expanded
+                ? 'Teljes képernyős nézet bezárása'
+                : 'Megnyitás teljes képernyőn'
+            }
+            aria-pressed={expanded}
+            onClick={() => setExpanded((current) => !current)}
+            title={
+              expanded
+                ? 'Teljes képernyős nézet bezárása'
+                : 'Megnyitás teljes képernyőn'
+            }
+            type="button"
+          >
+            {expanded ? (
+              <Minimize2 aria-hidden="true" size={16} />
+            ) : (
+              <Maximize2 aria-hidden="true" size={16} />
+            )}
+          </button>
           <button
             aria-label="CSV letöltése"
             onClick={() => downloadCsv(result)}
