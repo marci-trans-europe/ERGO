@@ -101,6 +101,9 @@ elemzési skillek verziózott, helyi Knowledge Packben találhatók. A csomag az
 alkalmazás része, nem tartalmaz jelszót vagy tranzakciós adatot. Az AI-val
 tervezett lekérdezések csak a kérdéshez szükséges sémarészlet mellett ezt a
 kuratált tudást kapják meg; a gyakori skillek továbbra is fix SQL-t használnak.
+Az 1.0.1-es tudásverzió a One Magyarország pontos `one` végfelhasználói kódját
+elkülöníti az All for One és Euro One szervezetektől; a névcsalád-bővítés csak
+külön engedélyezett szabálynál, például a MÁV vállalatcsoportnál történik meg.
 
 Minden elemzői válasz alatt külön jelölhető, hogy helyes volt-e. A javítandó
 válaszhoz kategória és szöveges korrekció adható. Az ERGO helyben, az

@@ -198,6 +198,8 @@ struct KnowledgeEntity {
     query_aliases: Vec<String>,
     exact_codes: Vec<String>,
     excluded_codes: Vec<String>,
+    #[serde(default)]
+    include_token_family: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -421,7 +423,7 @@ fn fixed_relationship_plan(question: &str, analysis_fy_window: u8) -> Option<Que
         entity
             .query_aliases
             .iter()
-            .any(|alias| normalized.contains(alias))
+            .any(|alias| contains_token_phrase(&normalized, alias))
     })?;
     let excluded = entity
         .excluded_codes
@@ -1250,6 +1252,8 @@ fn is_customer_purchase_question(question: &str) -> bool {
     [
         "mit vasarolt",
         "miket vasarolt",
+        "mit vasrolt",
+        "miket vasrolt",
         "milyen cikkeket",
         "milyen termekeket",
         "mit rendelt",
@@ -1268,7 +1272,7 @@ fn explicit_end_customer_name(question: &str) -> Option<String> {
     if !is_customer_purchase_question(question) || !normalized.contains("vegfelhasznalo") {
         return None;
     }
-    let purchase_marker = ["vasarolt", "rendelt", "vett"]
+    let purchase_marker = ["vasarolt", "vasrolt", "rendelt", "vett"]
         .iter()
         .filter_map(|marker| normalized.find(marker).map(|index| (index, *marker)))
         .min_by_key(|(index, _)| *index)?;
@@ -1313,6 +1317,13 @@ async fn resolve_end_customer(
     }
     search_variants.sort();
     search_variants.dedup();
+    let include_token_family = knowledge_pack().entities.iter().any(|entity| {
+        entity.include_token_family
+            && entity
+                .query_aliases
+                .iter()
+                .any(|alias| normalize_for_search(alias) == normalize_for_search(search_name))
+    });
     let name_conditions = search_variants
         .iter()
         .map(|variant| {
@@ -1358,6 +1369,26 @@ async fn resolve_end_customer(
                 .then_some((code, name))
         })
         .collect::<Vec<_>>();
+    if !include_token_family {
+        let exact_matches = matches
+            .iter()
+            .filter(|(code, _)| {
+                let compact_code = normalize_for_search(code)
+                    .split_whitespace()
+                    .collect::<String>();
+                search_variants.iter().any(|variant| {
+                    compact_code
+                        == normalize_for_search(variant)
+                            .split_whitespace()
+                            .collect::<String>()
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !exact_matches.is_empty() {
+            return Ok(exact_matches);
+        }
+    }
     Ok(matches)
 }
 
@@ -2654,13 +2685,19 @@ mod tests {
             explicit_end_customer_name("Mit vásárolt a MÁV végfelhasználó?"),
             Some("mav".into())
         );
+        assert_eq!(
+            explicit_end_customer_name(
+                "Milyen cikkeket vásrolt a One végfelhasználó az elmúlt 1 évben?"
+            ),
+            Some("one".into())
+        );
         assert!(explicit_end_customer_name("Miket vásárolt a Designshop?").is_none());
     }
 
     #[test]
     fn embedded_knowledge_pack_is_available_to_planning() {
         let pack = knowledge_pack();
-        assert_eq!(pack.version, "1.0.0");
+        assert_eq!(pack.version, "1.0.1");
         assert!(pack
             .metrics
             .iter()
@@ -2673,6 +2710,19 @@ mod tests {
             .skills
             .iter()
             .any(|skill| skill.id == "top_end_customers"));
+        let one = pack
+            .entities
+            .iter()
+            .find(|entity| entity.id == "one_hungary")
+            .expect("One Magyarország must have an entity rule");
+        assert_eq!(one.exact_codes, ["one"]);
+        assert!(!one.include_token_family);
+        let mav = pack
+            .entities
+            .iter()
+            .find(|entity| entity.id == "mav_family")
+            .expect("MÁV must have a company-family rule");
+        assert!(mav.include_token_family);
         let context = knowledge_prompt_context();
         assert!(context.contains("vatbase nem árbevétel"));
         assert!(context.contains("invoice/invoiceline -> endcustomer"));
@@ -2737,6 +2787,19 @@ mod tests {
         assert!(skill.contains("'birosag'"));
         assert!(skill.contains("'orszagosbirosagi'"));
         assert!(skill.contains("NEM az Országos Bírósági Hivatal"));
+    }
+
+    #[test]
+    fn one_hungary_relationship_plan_uses_only_the_exact_entity_code() {
+        let plan = fixed_relationship_plan(
+            "Milyen cikkeket vásárolt a One végfelhasználó az elmúlt 1 évben?",
+            1,
+        )
+        .expect("One Magyarország must use a fixed relationship plan");
+        assert!(plan.title.contains("One Magyarország Zrt."));
+        assert!(plan.sql.contains("IN ('one')"));
+        assert!(!plan.sql.contains("allforone"));
+        assert!(!plan.sql.contains("euroo"));
     }
 
     #[test]
@@ -2870,7 +2933,7 @@ mod tests {
                 !normalize_for_search(name).contains("autoritatea aeronautica")
             }));
 
-            let mav = resolve_end_customer(&settings, password, "mav")
+            let mav = resolve_end_customer(&settings, password.clone(), "mav")
                 .await
                 .expect("MÁV resolution must succeed");
             assert!(
@@ -2880,6 +2943,18 @@ mod tests {
             assert!(mav.iter().all(|(code, name)| {
                 code.eq_ignore_ascii_case("mav") || contains_token_phrase(name, "mav")
             }));
+
+            let one = resolve_end_customer(&settings, password.clone(), "one")
+                .await
+                .expect("One resolution must succeed");
+            assert_eq!(one.len(), 1, "Only the exact One entity may be resolved");
+            assert_eq!(one[0].0.to_ascii_lowercase(), "one");
+            let one_codes = one.iter().map(|(code, _)| code.clone()).collect::<Vec<_>>();
+            let one_plan = end_customer_purchase_plan("A One", &one_codes, 1);
+            let (_, rows, _) = run_query(&settings, password, &one_plan.sql, one_plan.max_rows)
+                .await
+                .expect("One purchase query must succeed");
+            assert!(!rows.is_empty(), "One purchase query returned no rows");
         });
     }
 

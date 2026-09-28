@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.0.1",
   "metrics": [
     {
       "id": "net_invoiced_revenue_base",
@@ -57,7 +57,24 @@
       "label": "Országos Bírósági Hivatal",
       "queryAliases": ["obh", "orszagos birosagi hivatal"],
       "exactCodes": ["birosag", "orszagosbirosagi"],
-      "excludedCodes": ["obh"]
+      "excludedCodes": ["obh"],
+      "includeTokenFamily": false
+    },
+    {
+      "id": "one_hungary",
+      "label": "One Magyarország Zrt.",
+      "queryAliases": ["one", "one magyarorszag", "one magyarorszag zrt"],
+      "exactCodes": ["one"],
+      "excludedCodes": ["allforone", "euroo"],
+      "includeTokenFamily": false
+    },
+    {
+      "id": "mav_family",
+      "label": "MÁV vállalatcsoport",
+      "queryAliases": ["mav"],
+      "exactCodes": [],
+      "excludedCodes": [],
+      "includeTokenFamily": true
     }
   ],
   "normalizationAliases": [
