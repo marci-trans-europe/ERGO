@@ -1,5 +1,5 @@
 {
-  "version": "1.0.1",
+  "version": "1.0.2",
   "metrics": [
     {
       "id": "net_invoiced_revenue_base",
@@ -75,6 +75,14 @@
       "exactCodes": [],
       "excludedCodes": [],
       "includeTokenFamily": true
+    },
+    {
+      "id": "4ig_group",
+      "label": "4iG vállalatcsoport",
+      "queryAliases": ["4ig", "4ig nyrt", "4ig informatikai"],
+      "exactCodes": ["4ig", "4igzrt", "4igurvedelmi"],
+      "excludedCodes": ["rheinmetall4ig"],
+      "includeTokenFamily": false
     }
   ],
   "normalizationAliases": [
@@ -104,7 +112,10 @@
       "id": "end_customer_purchases",
       "label": "Végfelhasználó vásárolt cikkei",
       "execution": "entity_resolution_and_fixed_sql",
-      "examples": ["Miket vásárolt az Idomszoft végfelhasználó?"]
+      "examples": [
+        "Miket vásárolt az Idomszoft végfelhasználó?",
+        "Listázd ki a 4iG által megvásárolt termékeket"
+      ]
     },
     {
       "id": "overdue_receivables",

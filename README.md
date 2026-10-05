@@ -104,6 +104,9 @@ kuratált tudást kapják meg; a gyakori skillek továbbra is fix SQL-t használ
 Az 1.0.1-es tudásverzió a One Magyarország pontos `one` végfelhasználói kódját
 elkülöníti az All for One és Euro One szervezetektől; a névcsalád-bővítés csak
 külön engedélyezett szabálynál, például a MÁV vállalatcsoportnál történik meg.
+Az 1.0.2-es verzió a „4iG által megvásárolt termékek” mondatszerkezetet is fix
+vásárlási skillként kezeli, és a 4iG ellenőrzött végfelhasználói kódjait külön
+tartja a pusztán hasonló nevű szervezetektől.
 
 Minden elemzői válasz alatt külön jelölhető, hogy helyes volt-e. A javítandó
 válaszhoz kategória és szöveges korrekció adható. Az ERGO helyben, az

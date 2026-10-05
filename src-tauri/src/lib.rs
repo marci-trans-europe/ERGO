@@ -1254,6 +1254,10 @@ fn is_customer_purchase_question(question: &str) -> bool {
         "miket vasarolt",
         "mit vasrolt",
         "miket vasrolt",
+        "megvasarolt cikk",
+        "megvasarolt termek",
+        "vasarolt cikk",
+        "vasarolt termek",
         "milyen cikkeket",
         "milyen termekeket",
         "mit rendelt",
@@ -1269,7 +1273,40 @@ fn is_customer_purchase_question(question: &str) -> bool {
 
 fn explicit_end_customer_name(question: &str) -> Option<String> {
     let normalized = normalize_for_search(question);
-    if !is_customer_purchase_question(question) || !normalized.contains("vegfelhasznalo") {
+    if !is_customer_purchase_question(question) {
+        return None;
+    }
+    if let Some((prefix, suffix)) = normalized.split_once(" altal ") {
+        if ["megvasarolt", "vasarolt", "rendelt", "vett"]
+            .iter()
+            .any(|marker| suffix.contains(marker))
+        {
+            let mut candidate = prefix.trim();
+            for command_prefix in [
+                "listazd ki ",
+                "sorold fel ",
+                "mutasd meg ",
+                "mutasd ",
+                "az ",
+                "a ",
+            ] {
+                candidate = candidate.strip_prefix(command_prefix).unwrap_or(candidate);
+            }
+            let safe = candidate
+                .chars()
+                .filter(|character| {
+                    character.is_ascii_alphanumeric() || character.is_ascii_whitespace()
+                })
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if safe.len() >= 3 {
+                return Some(safe);
+            }
+        }
+    }
+    if !normalized.contains("vegfelhasznalo") {
         return None;
     }
     let purchase_marker = ["vasarolt", "vasrolt", "rendelt", "vett"]
@@ -2691,13 +2728,19 @@ mod tests {
             ),
             Some("one".into())
         );
+        assert_eq!(
+            explicit_end_customer_name(
+                "Listázd ki a 4iG által megvásárolt termékeket az elmúlt 1 évből"
+            ),
+            Some("4ig".into())
+        );
         assert!(explicit_end_customer_name("Miket vásárolt a Designshop?").is_none());
     }
 
     #[test]
     fn embedded_knowledge_pack_is_available_to_planning() {
         let pack = knowledge_pack();
-        assert_eq!(pack.version, "1.0.1");
+        assert_eq!(pack.version, "1.0.2");
         assert!(pack
             .metrics
             .iter()
@@ -2723,6 +2766,13 @@ mod tests {
             .find(|entity| entity.id == "mav_family")
             .expect("MÁV must have a company-family rule");
         assert!(mav.include_token_family);
+        let four_ig = pack
+            .entities
+            .iter()
+            .find(|entity| entity.id == "4ig_group")
+            .expect("4iG must have a verified company-group rule");
+        assert_eq!(four_ig.exact_codes, ["4ig", "4igzrt", "4igurvedelmi"]);
+        assert!(four_ig.excluded_codes.contains(&"rheinmetall4ig".into()));
         let context = knowledge_prompt_context();
         assert!(context.contains("vatbase nem árbevétel"));
         assert!(context.contains("invoice/invoiceline -> endcustomer"));
@@ -2800,6 +2850,19 @@ mod tests {
         assert!(plan.sql.contains("IN ('one')"));
         assert!(!plan.sql.contains("allforone"));
         assert!(!plan.sql.contains("euroo"));
+    }
+
+    #[test]
+    fn four_ig_purchase_wording_uses_verified_end_customer_codes() {
+        let plan = fixed_relationship_plan(
+            "Listázd ki a 4iG által megvásárolt termékeket az elmúlt 1 évből",
+            1,
+        )
+        .expect("4iG purchase wording must use a fixed relationship plan");
+        assert!(plan.title.contains("4iG vállalatcsoport"));
+        assert!(plan.sql.contains("'4ig', '4igzrt', '4igurvedelmi'"));
+        assert!(!plan.sql.contains("rheinmetall4ig"));
+        assert!(plan.sql.contains("invoice i JOIN invoiceline il"));
     }
 
     #[test]
@@ -2983,6 +3046,42 @@ mod tests {
             assert!(rows[0]
                 .get("netto_szamlazott_arbevetel_alapdevizaban")
                 .is_some());
+        });
+    }
+
+    #[test]
+    #[ignore = "VPN-t és helyi .env fájlt igényel"]
+    fn live_4ig_purchase_relationship_returns_items() {
+        let env_path = std::env::var("ERGO_ENV_PATH").expect("ERGO_ENV_PATH is required");
+        let contents = std::fs::read_to_string(env_path).expect("the .env file must be readable");
+        let password = contents
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("MYSQL_PASSWORD="))
+            .map(|value| value.trim().trim_matches(['\'', '"']).to_string())
+            .filter(|value| !value.is_empty())
+            .expect("MYSQL_PASSWORD must be present");
+
+        let plan = fixed_relationship_plan(
+            "Listázd ki a 4iG által megvásárolt termékeket az elmúlt 1 évből",
+            1,
+        )
+        .expect("4iG purchase question must have a fixed plan");
+
+        tauri::async_runtime::block_on(async {
+            let settings = StoredSettings::default();
+            let (_, rows, truncated) = run_query(&settings, password, &plan.sql, plan.max_rows)
+                .await
+                .expect("4iG purchase query must succeed");
+            assert!(!rows.is_empty(), "4iG purchase query returned no rows");
+            assert!(!truncated);
+            assert!(rows.iter().all(|row| {
+                row.get("vegfelhasznalo_kod")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|code| {
+                        ["4ig", "4igzrt", "4igurvedelmi"]
+                            .contains(&code.to_ascii_lowercase().as_str())
+                    })
+            }));
         });
     }
 
