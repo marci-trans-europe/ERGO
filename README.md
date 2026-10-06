@@ -89,6 +89,14 @@ nélküli SQL-lekérdezést használnak, és nettó alapdevizás számlasorért�
 rangsorolnak. A hosszú lekérdezési eredmények tördelhető táblázatban jelennek
 meg, és egy gombbal teljes képernyős nézetre válthatók.
 
+A vásárlási kérdések magyarul és angolul is megfogalmazhatók. Az alkalmazás a
+megnevezett céget a megfelelő törzsben keresi: a „végfelhasználó” az
+`endcustomer`, a „viszonteladó” vagy „számlázott vevő” a `customer` felől
+kapcsolódik a könyvelt számlákhoz és cikksorokhoz. Ha a szerep vagy a cégnév
+hiányzik, az ERGO visszakérdez, mielőtt lekérdezést futtatna. A regressziós
+ellenőrzéshez kitölthető, 30 soros munkafüzet található az `evaluation`
+mappában.
+
 Az alkalmazás nem küldi el a teljes adatbázissémát minden kérdéssel. A táblák,
 oszlopok és idegen kulcsok katalógusát 24 órára helyben gyorsítótárazza, majd a
 magyar üzleti kérdés alapján legfeljebb 8 releváns táblát és táblánként 36

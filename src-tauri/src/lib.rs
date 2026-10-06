@@ -414,6 +414,33 @@ fn end_customer_purchase_plan(
     }
 }
 
+fn billed_customer_purchase_plan(
+    label: &str,
+    customer_codes: &[String],
+    analysis_fy_window: u8,
+    english: bool,
+) -> QueryPlan {
+    let quoted_codes = customer_codes
+        .iter()
+        .map(|code| format!("'{}'", code.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut plan = end_customer_purchase_plan(label, customer_codes, analysis_fy_window);
+    let old_filter = format!(
+        "(i.endcustomernumber IN ({quoted_codes}) OR il.endcustomernumber IN ({quoted_codes}))"
+    );
+    plan.sql = plan.sql.replace(
+        &old_filter,
+        &format!("i.customernumber IN ({quoted_codes})"),
+    );
+    plan.title = if english {
+        format!("Products purchased by {label} as invoiced customer — last {analysis_fy_window} FY")
+    } else {
+        format!("{label} által vásárolt cikkek — számlázott vevőként")
+    };
+    plan
+}
+
 fn fixed_relationship_plan(question: &str, analysis_fy_window: u8) -> Option<QueryPlan> {
     let normalized = normalize_for_search(question);
     if !is_customer_purchase_question(question) {
@@ -425,6 +452,21 @@ fn fixed_relationship_plan(question: &str, analysis_fy_window: u8) -> Option<Que
             .iter()
             .any(|alias| contains_token_phrase(&normalized, alias))
     })?;
+    if entity.id == "one_hungary"
+        && ["one year", "one fiscal year", "one fy"]
+            .iter()
+            .any(|period| normalized.contains(period))
+        && ![
+            "one end customer",
+            "one end user",
+            "one magyarorszag",
+            "one zrt",
+        ]
+        .iter()
+        .any(|name| normalized.contains(name))
+    {
+        return None;
+    }
     let excluded = entity
         .excluded_codes
         .iter()
@@ -436,8 +478,67 @@ fn fixed_relationship_plan(question: &str, analysis_fy_window: u8) -> Option<Que
         .filter(|code| !excluded.contains(&normalize_for_search(code)))
         .cloned()
         .collect::<Vec<_>>();
-    (!codes.is_empty())
-        .then(|| end_customer_purchase_plan(&entity.label, &codes, analysis_fy_window))
+    if codes.is_empty() {
+        return None;
+    }
+    let mut plan = end_customer_purchase_plan(&entity.label, &codes, analysis_fy_window);
+    if is_english_question(question) {
+        plan.title = format!(
+            "Products purchased by {} as end customer — last {analysis_fy_window} FY",
+            entity.label
+        );
+    }
+    Some(plan)
+}
+
+fn purchase_role_clarification(question: &str) -> Option<String> {
+    if !is_customer_purchase_question(question)
+        || fixed_relationship_plan(question, 1).is_some()
+        || explicit_billed_customer_name(question).is_some()
+        || explicit_end_customer_name(question).is_some()
+    {
+        return None;
+    }
+    if is_english_question(question) {
+        Some("For this purchase search, do you mean the invoiced reseller/customer or the end customer? Please also name the company.".into())
+    } else {
+        Some("Ehhez a vásárlási kereséshez a számlázott viszonteladót/vevőt vagy a végfelhasználót keresed? Kérlek, add meg a cég nevét is.".into())
+    }
+}
+
+fn is_english_question(question: &str) -> bool {
+    let normalized = normalize_for_search(question);
+    [
+        "what",
+        "which",
+        "list",
+        "show",
+        "find",
+        "products",
+        "items",
+        "bought",
+        "buy",
+        "purchased",
+        "reseller",
+        "customer",
+        "end user",
+        "this year",
+        "last year",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+        && ![
+            "mely",
+            "milyen",
+            "listazd",
+            "mutasd",
+            "vasarolt",
+            "vegfelhasznalo",
+            "idén",
+            "iden",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1249,7 +1350,7 @@ Az adatokat nem módosítom. A lekérdezéseket a kérdésben megadott időszakr
 
 fn is_customer_purchase_question(question: &str) -> bool {
     let normalized = normalize_for_search(question);
-    [
+    let known_hungarian_forms = [
         "mit vasarolt",
         "miket vasarolt",
         "mit vasrolt",
@@ -1268,13 +1369,109 @@ fn is_customer_purchase_question(question: &str) -> bool {
         "beszerzett termek",
     ]
     .iter()
-    .any(|phrase| normalized.contains(phrase))
+    .any(|phrase| normalized.contains(phrase));
+    let purchase_verbs = [
+        "vasarol",
+        "vasrol",
+        "rendel",
+        "vett",
+        "megvasarol",
+        "buy",
+        "bought",
+        "purchase",
+        "purchased",
+        "order",
+        "ordered",
+    ];
+    let product_words = ["termek", "cikk", "product", "item", "goods"];
+    known_hungarian_forms
+        || (purchase_verbs.iter().any(|verb| normalized.contains(verb))
+            && product_words.iter().any(|word| normalized.contains(word)))
+        || ((normalized.contains("what did")
+            || normalized.contains("which did")
+            || normalized.contains("what has")
+            || normalized.contains("list "))
+            && purchase_verbs.iter().any(|verb| normalized.contains(verb)))
+}
+
+fn explicit_billed_customer_name(question: &str) -> Option<String> {
+    let normalized = normalize_for_search(question);
+    if !is_customer_purchase_question(question) {
+        return None;
+    }
+    if (normalized.contains("end customer")
+        || normalized.contains("end user")
+        || normalized.contains("final customer")
+        || normalized.contains("vegfelhasznalo"))
+        && !normalized.contains("reseller")
+        && !normalized.contains("viszontelado")
+        && !normalized.contains("billed customer")
+        && !normalized.contains("invoiced customer")
+    {
+        return None;
+    }
+
+    let patterns = [
+        // Hungarian: "termékeket, melyeket a DesignShop viszonteladó vásárolt"
+        r"\b(?:melyeket|amelyeket|amiket)\s+(?:az?\s+)?(.+?)\s+(?:viszontelado|szamlazott\s+(?:partner|vevo))\b",
+        r"\b(?:mit|miket|milyen\s+(?:cikkeket|termekeket))\s+(?:vasarolt|vasrolt|rendelt|vett)\s+(?:az?\s+)?(.+?)\s+(?:viszontelado|szamlazott\s+(?:partner|vevo))\b",
+        r"\b(?:az?\s+)?(.+?)\s+(?:viszontelado|szamlazott\s+(?:partner|vevo))\s+(?:vasarol|vasrol|rendel|vett)\b",
+        // English: "products purchased by the DesignShop reseller" / "what did DesignShop buy"
+        r"\b(?:by|from|did|has)\s+(?:the\s+)?(.+?)\s+(?:reseller|customer|billed\s+customer|invoiced\s+customer)\b",
+        r"\b(?:products?|items?)\s+(?:that\s+)?(?:the\s+)?(.+?)\s+(?:reseller|billed\s+customer)\s+(?:bought|purchased|ordered)\b",
+    ];
+    for pattern in patterns {
+        let regex = Regex::new(pattern).expect("valid buyer extraction regex");
+        if let Some(captures) = regex.captures(&normalized) {
+            let candidate = captures.get(1)?.as_str().trim();
+            let candidate = candidate
+                .trim_start_matches("the ")
+                .trim_start_matches("a ")
+                .trim_start_matches("az ")
+                .trim();
+            let candidate = candidate
+                .split_whitespace()
+                .take_while(|word| {
+                    !["this", "last", "year", "today", "idén", "iden"].contains(word)
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if candidate.len() >= 2 {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn explicit_end_customer_name(question: &str) -> Option<String> {
     let normalized = normalize_for_search(question);
     if !is_customer_purchase_question(question) {
         return None;
+    }
+    if normalized.contains("end customer")
+        || normalized.contains("end user")
+        || normalized.contains("final customer")
+    {
+        let patterns = [
+            r"\bby\s+(?:the\s+)?(.+?)\s+(?:as\s+(?:an?\s+)?)?(?:end\s+customer|end\s+user|final\s+customer)\b",
+            r"\bwhat\s+did\s+(?:the\s+)?(.+?)\s+(?:as\s+(?:an?\s+)?)?(?:end\s+customer|end\s+user|final\s+customer)\b",
+            r"\bwhat\s+(?:products?|items?).*?\bdid\s+(?:the\s+)?(.+?)\s+(?:as\s+(?:an?\s+)?)?(?:end\s+customer|end\s+user|final\s+customer)\b",
+            r"\b(?:end\s+customer|end\s+user|final\s+customer)\s+(.+?)\s+(?:buy|bought|purchase|purchased)\b",
+        ];
+        for pattern in patterns {
+            let regex = Regex::new(pattern).expect("valid end-customer extraction regex");
+            if let Some(captures) = regex.captures(&normalized) {
+                let candidate = captures.get(1)?.as_str().trim();
+                let candidate = candidate
+                    .trim_start_matches("the ")
+                    .trim_start_matches("a ")
+                    .trim();
+                if candidate.len() >= 2 {
+                    return Some(candidate.to_string());
+                }
+            }
+        }
     }
     if let Some((prefix, suffix)) = normalized.split_once(" altal ") {
         if ["megvasarolt", "vasarolt", "rendelt", "vett"]
@@ -1429,6 +1626,67 @@ async fn resolve_end_customer(
     Ok(matches)
 }
 
+async fn resolve_billed_customer(
+    settings: &StoredSettings,
+    password: String,
+    search_name: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let compact_search = search_name.replace(' ', "");
+    if compact_search.len() < 2
+        || !compact_search
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        return Ok(Vec::new());
+    }
+    let like_search = search_name.split_whitespace().collect::<Vec<_>>().join("%");
+    let sql = format!(
+        "SELECT customernumber AS customer_code, COALESCE(NULLIF(TRIM(CONCAT_WS(' ', name1, name2)), ''), customernumber) AS customer_name, TRIM(CONCAT_WS(' ', name1, name2, name3, name4, name5)) AS customer_searchable FROM customer WHERE LOWER(customernumber) = '{search_name}' OR LOWER(CONCAT_WS(' ', name1, name2, name3, name4, name5)) LIKE '%{like_search}%' LIMIT 100"
+    );
+    let (_, rows, _) = run_query(settings, password, &sql, 100).await?;
+    let needle = normalize_for_search(search_name);
+    let mut seen_codes = HashSet::new();
+    let matches = rows
+        .into_iter()
+        .filter_map(|row| {
+            let code = row.get("customer_code")?.as_str()?.trim().to_string();
+            let name = row
+                .get("customer_name")
+                .and_then(JsonValue::as_str)
+                .unwrap_or(&code)
+                .trim()
+                .to_string();
+            let searchable_name = row
+                .get("customer_searchable")
+                .and_then(JsonValue::as_str)
+                .unwrap_or(&name);
+            let exact_code = normalize_for_search(&code)
+                .split_whitespace()
+                .collect::<String>()
+                == needle.split_whitespace().collect::<String>();
+            (!code.is_empty()
+                && (exact_code || contains_token_phrase(searchable_name, &needle))
+                && seen_codes.insert(code.clone()))
+            .then_some((code, name))
+        })
+        .collect::<Vec<_>>();
+    let exact_codes = matches
+        .iter()
+        .filter(|(code, _)| {
+            normalize_for_search(code)
+                .split_whitespace()
+                .collect::<String>()
+                == needle.split_whitespace().collect::<String>()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(if exact_codes.is_empty() {
+        matches
+    } else {
+        exact_codes
+    })
+}
+
 fn contains_token_phrase(value: &str, phrase: &str) -> bool {
     let value = normalize_for_search(value);
     let phrase = normalize_for_search(phrase);
@@ -1456,8 +1714,10 @@ fn business_relationship_skill(question: &str) -> &'static str {
 - Csak companynumber = '1' és posted = 1 számlákat használj; debitcredit = 1 esetén a jóváírást vond le."#;
     }
 
-    r#"Aktív üzleti relációs skill — vevői vásárlások:
+    r#"Aktív üzleti relációs skill — vevői vásárlások / customer purchases:
 - A számlázott partner és a tényleges végfelhasználó eltérhet. Mindkét relációt vizsgáld meg.
+- English wording: "reseller", "billed customer" or "invoiced customer" means customer.customernumber through invoice.customernumber. "End customer" or "end user" means endcustomer.endcustomernumber through invoice/invoiceline.endcustomernumber.
+- If the role is not stated and cannot be established from a curated exact entity rule, ask which role is intended before querying. Do not silently substitute an entity or role.
 - Kimenő értékesítési lánc: invoice -> invoiceline a companynumber + invoicenumber mezőkön; invoice.customernumber -> customer.customernumber; invoice.endcustomernumber vagy invoiceline.endcustomernumber -> endcustomer.endcustomernumber.
 - A kérdésben szereplő szervezetet a customer és endcustomer name1..name5 mezőiben, továbbá a számlafej név-pillanatképében keresd. Ne feltételezd, hogy a rövidítés az adatbázisbeli kód.
 - A találatokban mutasd meg a számlázott partnert, a végfelhasználót, a számlaszámot és dátumot, a cikkszámot, megnevezést, előjeles mennyiséget és előjeles nettó linepricebase értéket.
@@ -1954,9 +2214,35 @@ fn validate_planned_sql(question: &str, sql: &str) -> Result<String, String> {
                     .into(),
             );
         }
-        if !lower.contains("endcustomernumber") {
+        let filters_end_customer = lower.contains("endcustomernumber in (");
+        let filters_billed_customer = Regex::new(r"(?i)\bi\.customernumber\s+in\s*\(")
+            .expect("valid billed-customer filter regex")
+            .is_match(&normalized);
+        let question_role = normalize_for_search(question);
+        let explicitly_end_customer = [
+            "vegfelhasznalo",
+            "end customer",
+            "end user",
+            "final customer",
+        ]
+        .iter()
+        .any(|role| question_role.contains(role));
+        let explicitly_billed_customer = [
+            "viszontelado",
+            "szamlazott partner",
+            "szamlazott vevo",
+            "reseller",
+            "billed customer",
+            "invoiced customer",
+        ]
+        .iter()
+        .any(|role| question_role.contains(role));
+        if (explicitly_end_customer && !filters_end_customer)
+            || (explicitly_billed_customer && !filters_billed_customer)
+            || (!filters_end_customer && !filters_billed_customer)
+        {
             return Err(
-                "A számlázott vevő eltérhet a végfelhasználótól: a vásárlási lekérdezésnek az invoice vagy invoiceline endcustomernumber relációját is vizsgálnia kell."
+                "A vásárlási lekérdezésben a kérdezett szerepet kell szűrni: számlázott vevőhöz invoice.customernumber, végfelhasználóhoz endcustomernumber szükséges."
                     .into(),
             );
         }
@@ -2263,7 +2549,7 @@ async fn summarize_query_result(
         .take(SUMMARY_PREVIEW_CHARACTERS)
         .collect::<String>();
     let summary_system = r#"Te az ERGO, a Trans-Europe üzleti adatelemzője vagy.
-Magyarul válaszolj. Kezdd a legfontosabb üzleti következtetéssel, majd támaszd alá a kapott számokkal.
+Válaszolj a felhasználó kérdésének nyelvén: magyar kérdésre magyarul, angol kérdésre angolul. Kezdd a legfontosabb üzleti következtetéssel, majd támaszd alá a kapott számokkal.
 Ne találj ki adatot, pénznemet, mértékegységet vagy üzleti definíciót. Ha az eredmény üres vagy kétértelmű, ezt mondd ki.
 Minden pénzösszeget magyar formátumban, hármas számjegycsoportokkal és legfeljebb két tizedessel írj, például: 24 752 384,12.
 Legyél tömör és gyakorlatias, legfeljebb 180 szóban. Jelezd, ha a látható eredmény korlátozott. Markdown használható."#;
@@ -2350,6 +2636,12 @@ async fn analyze_erp(
             result: None,
         });
     }
+    if let Some(clarification) = purchase_role_clarification(question.trim()) {
+        return Ok(AnalyzeResponse {
+            summary: clarification,
+            result: None,
+        });
+    }
     let settings = read_settings(&app)?;
     let mysql_password = read_secret(
         &app,
@@ -2359,24 +2651,99 @@ async fn analyze_erp(
     )?;
     let api_key = read_secret(&app, "AI_API_KEY", AI_API_KEY_ACCOUNT, "AI API-kulcs")?;
     let analysis_fy_window = validate_analysis_fy_window(settings.analysis_fy_window)?;
-    let mut relationship_plan = top_end_customers_plan(question.trim(), analysis_fy_window)
-        .or_else(|| fixed_relationship_plan(question.trim(), analysis_fy_window));
+    let billed_customer_name = explicit_billed_customer_name(question.trim());
+    let mut relationship_plan = if let Some(search_name) = billed_customer_name {
+        let matches =
+            resolve_billed_customer(&settings, mysql_password.clone(), &search_name).await?;
+        if matches.is_empty() {
+            return Ok(AnalyzeResponse {
+                summary: if is_english_question(question.trim()) {
+                    format!("I could not find an invoiced customer named {search_name}. Please provide the exact company name, or clarify if you mean the end customer.")
+                } else {
+                    format!("Nem találtam számlázott vevőt ehhez a névhez: {search_name}. Kérlek, add meg a pontos céget vagy jelezd, ha végfelhasználót keresel.")
+                },
+                result: None,
+            });
+        }
+        if matches.len() > 1 {
+            let candidates = matches
+                .iter()
+                .take(5)
+                .map(|(code, name)| format!("{name} ({code})"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Ok(AnalyzeResponse {
+                summary: if is_english_question(question.trim()) {
+                    format!("I found several invoiced customers matching {search_name}: {candidates}. Which one do you mean? Please use the customer code if possible.")
+                } else {
+                    format!("Több számlázott vevő is illik erre: {search_name}. Találatok: {candidates}. Melyikre gondolsz? Ha lehet, add meg az ügyfélkódot.")
+                },
+                result: None,
+            });
+        }
+        let label = matches[0].1.clone();
+        let codes = matches
+            .into_iter()
+            .map(|(code, _)| code)
+            .collect::<Vec<_>>();
+        Some(billed_customer_purchase_plan(
+            &label,
+            &codes,
+            analysis_fy_window,
+            is_english_question(question.trim()),
+        ))
+    } else {
+        top_end_customers_plan(question.trim(), analysis_fy_window)
+            .or_else(|| fixed_relationship_plan(question.trim(), analysis_fy_window))
+    };
     if relationship_plan.is_none() {
         if let Some(search_name) = explicit_end_customer_name(question.trim()) {
             let matches =
                 resolve_end_customer(&settings, mysql_password.clone(), &search_name).await?;
-            if !matches.is_empty() {
-                let label = matches[0].1.clone();
-                let codes = matches
-                    .into_iter()
-                    .map(|(code, _)| code)
-                    .collect::<Vec<_>>();
-                relationship_plan = Some(end_customer_purchase_plan(
-                    &label,
-                    &codes,
-                    analysis_fy_window,
-                ));
+            if matches.is_empty() {
+                return Ok(AnalyzeResponse {
+                    summary: if is_english_question(question.trim()) {
+                        format!("I could not find an end customer named {search_name}. Please provide the exact company name or code.")
+                    } else {
+                        format!("Nem találtam végfelhasználót ehhez a névhez: {search_name}. Kérlek, add meg a pontos cégnevet vagy kódot.")
+                    },
+                    result: None,
+                });
             }
+            let known_family = knowledge_pack().entities.iter().any(|entity| {
+                entity.include_token_family
+                    && entity.query_aliases.iter().any(|alias| {
+                        normalize_for_search(alias) == normalize_for_search(&search_name)
+                    })
+            });
+            if matches.len() > 1 && !known_family {
+                let candidates = matches
+                    .iter()
+                    .take(5)
+                    .map(|(code, name)| format!("{name} ({code})"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Ok(AnalyzeResponse {
+                    summary: if is_english_question(question.trim()) {
+                        format!("I found several end customers matching {search_name}: {candidates}. Which one do you mean?")
+                    } else {
+                        format!("Több végfelhasználó is illik erre: {search_name}. Találatok: {candidates}. Melyikre gondolsz?")
+                    },
+                    result: None,
+                });
+            }
+            let label = matches[0].1.clone();
+            let codes = matches
+                .into_iter()
+                .map(|(code, _)| code)
+                .collect::<Vec<_>>();
+            let mut plan = end_customer_purchase_plan(&label, &codes, analysis_fy_window);
+            if is_english_question(question.trim()) {
+                plan.title = format!(
+                    "Products purchased by {label} as end customer — last {analysis_fy_window} FY"
+                );
+            }
+            relationship_plan = Some(plan);
         }
     }
     if let Some(plan) = relationship_plan {
@@ -2443,6 +2810,7 @@ async fn analyze_erp(
     let knowledge_context = knowledge_prompt_context();
     let planner_system = format!(
         r#"Te az ERGO, a Trans-Europe óvatos ERP-adatelemzője vagy.
+Magyarul és angolul is értelmezd a kérdéseket. A title mezőt a kérdés nyelvén add meg.
 Készíts pontos MySQL lekérdezési tervet a megadott adatbázis-séma alapján.
 Kizárólag egy SELECT vagy WITH lekérdezést adhatsz. Tilos minden adatmódosítás, DDL, zárolás, fájlművelet, komment, rendszer-séma és több utasítás.
 Az sql mező pontosan egyetlen SELECT vagy WITH utasítást tartalmazzon, záró pontosvessző nélkül. Ne használj SET, DECLARE, ideiglenes táblát vagy tárolt eljárást.
@@ -2465,6 +2833,7 @@ Időfüggő üzleti adatoknál kötelező közvetlenül az SQL WHERE feltételé
 - fejlécszámhoz ne kapcsolj tételtáblát, ha a kérdés nem kér tételszintű adatot.
 
 {relationship_skill}
+Vevői termékvásárlásnál ne keverd össze a számlázott vevőt/viszonteladót (invoice.customernumber -> customer.customernumber) a tényleges végfelhasználóval (endcustomernumber -> endcustomer.endcustomernumber). Ha a kérdés szerepe nem egyértelmű, ne válassz helyette: kérdezz vissza, hogy a számlázott viszonteladót/vevőt vagy a végfelhasználót keressük.
 Helyi, verziózott ERP-tudás:
 {knowledge_context}
 Kizárólag JSON objektummal válaszolj ebben az alakban:
@@ -2571,15 +2940,16 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_read_only_sql, business_relationship_skill, capability_answer,
-        contains_token_phrase, end_customer_purchase_plan, explicit_end_customer_name,
-        extract_json, fixed_quick_plan, fixed_relationship_plan, is_chat_model, knowledge_pack,
-        knowledge_prompt_context, normalize_for_search, percent_encode_mailto,
-        requested_top_end_customer_limit, resolve_end_customer, responses_input, run_query,
-        schema_search_terms, select_schema_context, table_business_metadata,
-        top_end_customers_plan, validate_analysis_fy_window, validate_feedback, validate_model,
-        validate_planned_sql, AnalysisFeedbackInput, CatalogColumn, JsonValue, QueryPlan,
-        SchemaCatalog, SchemaTable, StoredSettings,
+        assert_read_only_sql, billed_customer_purchase_plan, business_relationship_skill,
+        capability_answer, contains_token_phrase, end_customer_purchase_plan,
+        explicit_billed_customer_name, explicit_end_customer_name, extract_json, fixed_quick_plan,
+        fixed_relationship_plan, is_chat_model, is_customer_purchase_question, is_english_question,
+        knowledge_pack, knowledge_prompt_context, normalize_for_search, percent_encode_mailto,
+        purchase_role_clarification, requested_top_end_customer_limit, resolve_end_customer,
+        responses_input, run_query, schema_search_terms, select_schema_context,
+        table_business_metadata, top_end_customers_plan, validate_analysis_fy_window,
+        validate_feedback, validate_model, validate_planned_sql, AnalysisFeedbackInput,
+        CatalogColumn, JsonValue, QueryPlan, SchemaCatalog, SchemaTable, StoredSettings,
     };
 
     #[test]
@@ -2735,6 +3105,81 @@ mod tests {
             Some("4ig".into())
         );
         assert!(explicit_end_customer_name("Miket vásárolt a Designshop?").is_none());
+    }
+
+    #[test]
+    fn recognizes_hungarian_and_english_purchase_wording_and_reseller_roles() {
+        let hu = "Listázd ki azokat a termékeket, melyeket a DesignShop viszonteladó vásárolt idén";
+        let en = "List the products that the DesignShop reseller purchased this year";
+        assert!(is_customer_purchase_question(hu));
+        assert!(is_customer_purchase_question(en));
+        assert_eq!(explicit_billed_customer_name(hu), Some("designshop".into()));
+        assert_eq!(explicit_billed_customer_name(en), Some("designshop".into()));
+        assert!(purchase_role_clarification(hu).is_none());
+        assert!(purchase_role_clarification(en).is_none());
+        assert!(is_english_question(en));
+    }
+
+    #[test]
+    fn extracts_other_company_names_in_both_languages() {
+        let cases = [
+            ("Miket vásárolt a Northwind viszonteladó idén?", "northwind"),
+            (
+                "Milyen termékeket vásárolt a Kék Duna Kft. viszonteladó?",
+                "kek duna kft",
+            ),
+            (
+                "List products purchased by the Contoso reseller this year",
+                "contoso",
+            ),
+            (
+                "What items did the Fabrikam reseller buy this year?",
+                "fabrikam",
+            ),
+        ];
+        for (question, expected) in cases {
+            assert_eq!(
+                explicit_billed_customer_name(question).as_deref(),
+                Some(expected),
+                "failed for {question}"
+            );
+        }
+    }
+
+    #[test]
+    fn asks_before_query_when_purchase_role_is_ambiguous() {
+        let question = "What products did DesignShop buy this year?";
+        let clarification = purchase_role_clarification(question)
+            .expect("ambiguous purchase role must trigger clarification");
+        assert!(clarification.contains("invoiced reseller/customer"));
+        assert!(clarification.contains("end customer"));
+        assert_eq!(explicit_billed_customer_name(question), None);
+        assert_eq!(explicit_end_customer_name(question), None);
+        assert!(fixed_relationship_plan("Which products were bought in one year?", 1).is_none());
+        assert!(purchase_role_clarification("Which products were bought in one year?").is_some());
+    }
+
+    #[test]
+    fn recognizes_english_end_customer_and_does_not_misclassify_it_as_billed_customer() {
+        let question = "What products did the One end customer buy this year?";
+        assert_eq!(explicit_end_customer_name(question), Some("one".into()));
+        assert_eq!(explicit_billed_customer_name(question), None);
+        assert!(purchase_role_clarification(question).is_none());
+    }
+
+    #[test]
+    fn billed_customer_plan_filters_invoice_customer_not_end_customer() {
+        let plan = billed_customer_purchase_plan("DesignShop Kft.", &["webworx".into()], 1, true);
+        assert!(plan.title.contains("invoiced customer"));
+        assert!(plan.sql.contains("i.customernumber IN ('webworx')"));
+        assert!(!plan.sql.contains("i.endcustomernumber IN ('webworx')"));
+        assert!(plan.sql.contains("i.companynumber = '1'"));
+        assert!(plan.sql.contains("i.posted = 1"));
+        assert!(validate_planned_sql(
+            "List the products that the DesignShop reseller purchased this year",
+            &plan.sql
+        )
+        .is_ok());
     }
 
     #[test]
