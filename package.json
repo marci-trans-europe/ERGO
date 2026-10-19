@@ -1,6 +1,6 @@
 {
   "name": "ergo-live-analyst",
-  "version": "0.3.10",
+  "version": "0.3.11",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -10,6 +10,7 @@
     "desktop:dev": "tauri dev",
     "desktop:build": "tauri build",
     "lint": "eslint .",
+    "test:taxonomy": "node --test tests/product-taxonomy.test.mjs",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

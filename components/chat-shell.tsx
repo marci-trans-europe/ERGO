@@ -1,5 +1,6 @@
 'use client'
 
+import { useState } from 'react'
 import {
   ArrowUp,
   BarChart3,
@@ -12,11 +13,13 @@ import {
   ShieldCheck,
   Sparkles,
   TrendingUp,
+  Tags,
 } from 'lucide-react'
 
 import { MessageView } from '@/components/message-view'
 import { FeedbackWidget } from '@/components/feedback-widget'
 import { SettingsDialog } from '@/components/settings-dialog'
+import { ProductCatalogView } from '@/components/product-catalog'
 import { useAppUpdater } from '@/components/use-app-updater'
 import { useErpChat } from '@/components/use-erp-chat'
 
@@ -81,6 +84,7 @@ const modelLabels: Record<string, string> = {
 const modelLabel = (model: string) => modelLabels[model] ?? model
 
 export const ChatShell = () => {
+  const [activeView, setActiveView] = useState<'chat' | 'catalog'>('chat')
   const updater = useAppUpdater()
   const {
     availableModels,
@@ -119,7 +123,7 @@ export const ChatShell = () => {
 
           <button
             className="new-chat-button"
-            onClick={clearConversation}
+            onClick={() => { clearConversation(); setActiveView('chat') }}
             type="button"
           >
             <MessageSquarePlus aria-hidden="true" size={17} />
@@ -132,13 +136,25 @@ export const ChatShell = () => {
               <button
                 disabled={isBusy}
                 key={label}
-                onClick={() => void submitMessage(prompt, id)}
+                onClick={() => { setActiveView('chat'); void submitMessage(prompt, id) }}
                 type="button"
               >
                 <Icon aria-hidden="true" size={16} />
                 <span>{label}</span>
               </button>
             ))}
+          </nav>
+
+          <nav className="catalog-nav" aria-label="Katalógus">
+            <p className="nav-label">KATALÓGUS</p>
+            <button
+              aria-current={activeView === 'catalog' ? 'page' : undefined}
+              onClick={() => setActiveView('catalog')}
+              type="button"
+            >
+              <Tags aria-hidden="true" size={16} />
+              <span>Termékkategóriák</span>
+            </button>
           </nav>
 
           <div className="sidebar-spacer" />
@@ -166,7 +182,8 @@ export const ChatShell = () => {
           </button>
         </aside>
 
-        <main className="chat-main">
+        <main className={activeView === 'catalog' ? 'catalog-main' : 'chat-main'}>
+          {activeView === 'catalog' ? <ProductCatalogView /> : <>
           <header className="chat-header">
             <div>
               <p className="header-kicker">ÉLŐ ERP ELEMZŐ</p>
@@ -301,6 +318,7 @@ export const ChatShell = () => {
               ellenőrizd üzleti döntés előtt.
             </p>
           </div>
+          </>}
         </main>
       </div>
       <FeedbackWidget />

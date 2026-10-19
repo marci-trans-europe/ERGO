@@ -115,3 +115,34 @@ export type KnowledgeOverview = {
     status: string
   }>
 }
+
+export type ProductCatalogPeriod = {
+  itemNumber: string
+  itemName: string
+  year: number
+  quarter: number
+  quantity: number
+  netBase: number
+  invoiceLines: number
+}
+
+export type ProductCatalog = {
+  currentYear: number
+  periods: ProductCatalogPeriod[]
+}
+
+export type ProductSale = {
+  invoiceNumber: string
+  invoiceDate: string
+  resellerCode: string
+  reseller: string
+  endCustomerCode: string
+  endCustomer: string
+  quantity: number
+  netBase: number
+}
+
+export type ProductSales = {
+  rows: ProductSale[]
+  truncated: boolean
+}

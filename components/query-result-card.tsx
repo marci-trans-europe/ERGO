@@ -103,6 +103,9 @@ const findChartColumns = (result: QueryResult) => {
   const valueColumn =
     numericColumns.find((column) => isAmountColumn(column)) ?? numericColumns[0]
   const preferredLabels = [
+    'cikk',
+    'itemtext1',
+    'item_name',
     'ugyfel',
     'ügyfél',
     'customer_name',
@@ -143,9 +146,8 @@ const ResultChart = ({ result }: QueryResultCardProps) => {
     .filter((point) => Number.isFinite(point.value))
     .slice(0, 50)
 
-  if (points.length < 2) return null
-
   const isBarChart = result.visualization === 'bar'
+  if (points.length < (isBarChart ? 1 : 2)) return null
   const width = Math.max(760, points.length * (isBarChart ? 88 : 72))
   const height = isBarChart ? 330 : 290
   const padding = {
@@ -443,7 +445,10 @@ export const QueryResultCard = ({ result }: QueryResultCardProps) => {
           rekord nem található.
         </div>
       ) : hasChart ? (
-        <ResultChart result={result} />
+        <div className="result-visuals">
+          <ResultChart result={result} />
+          <ResultTable columns={result.columns} rows={result.rows} />
+        </div>
       ) : (
         <ResultTable columns={result.columns} rows={result.rows} />
       )}

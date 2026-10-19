@@ -7,6 +7,8 @@ import type {
   ChatMessage,
   DesktopSettings,
   KnowledgeOverview,
+  ProductCatalog,
+  ProductSales,
   QuickAnalysis,
   SettingsInput,
 } from '@/lib/types'
@@ -72,6 +74,19 @@ export const saveAnalysisFeedback = async (
 export const loadKnowledgeOverview = async (): Promise<KnowledgeOverview> => {
   ensureDesktop()
   return invoke<KnowledgeOverview>('load_knowledge_overview')
+}
+
+export const loadProductCatalog = async (): Promise<ProductCatalog> => {
+  ensureDesktop()
+  return invoke<ProductCatalog>('load_product_catalog')
+}
+
+export const loadProductSales = async (
+  itemNumber: string,
+  itemName: string,
+): Promise<ProductSales> => {
+  ensureDesktop()
+  return invoke<ProductSales>('load_product_sales', { itemNumber, itemName })
 }
 
 export const emailAnalysisFeedback = async (
