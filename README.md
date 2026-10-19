@@ -100,7 +100,41 @@ mappában.
 Az alkalmazás nem küldi el a teljes adatbázissémát minden kérdéssel. A táblák,
 oszlopok és idegen kulcsok katalógusát 24 órára helyben gyorsítótárazza, majd a
 magyar üzleti kérdés alapján legfeljebb 8 releváns táblát és táblánként 36
-fontos oszlopot választ ki. A séma teljes tartalma nem kerül a GitHubra.
+fontos oszlopot választ ki. Emellett minden dinamikus kérdés megkapja a
+számlázási mag táblákat (`invoice`, `invoiceline`, `customer`, `endcustomer`,
+`customerentry`) és — oszlopok nélkül — az összes táblanév listáját, hogy a
+modell tudja, mi létezik, és ne találjon ki táblanevet. A séma teljes tartalma
+nem kerül a GitHubra.
+
+A sémagyorsítótár a kis kardinalitású kód-, státusz- és dátummezőkhöz tényleges
+mintaértékeket is gyűjt, korlátozott olvasási ablakból (legfeljebb 80 oszlop,
+oszloponként 10 érték). Ebből derül ki például, hogy a `debitcredit` értéke 0/1,
+és hogy egy varchar dátummező valóban ponttal tagolt. A mintavétel legjobb
+szándékú: ha nem sikerül, a séma e nélkül is használható.
+
+## Agentikus lekérdezéstervezés
+
+A Responses API-t használó modellek nem egyetlen lövésből terveznek. A
+tervezés közben eszközöket hívhatnak, legfeljebb 8 körben:
+
+- `search_schema` és `describe_table` — tábla és oszlop keresése a teljes
+  katalógusban, ha a kiválasztott sémarészlet nem elég;
+- `resolve_entity` — cégnév feloldása ellenőrzött kódokra, kötelezően megadott
+  szereppel (végfelhasználó vagy számlázott vevő);
+- `probe_query` — próbalekérdezés legfeljebb 20 sorral és kérdésenként
+  legfeljebb 5 alkalommal, a join, a dátumformátum és a kódértékek
+  ellenőrzésére;
+- `submit_plan` — a végleges terv beadása, ami zárja a ciklust.
+
+A biztonsági modell nem változik: a próbalekérdezések ugyanazon a csak olvasható
+őrön futnak, a végleges SQL pedig változatlanul átmegy a teljes biztonsági és
+üzleti ellenőrzésen. A chat/completions modellek a korábbi egylövésű úton
+maradnak.
+
+A terv ellenőrzése és futtatása egyetlen javító ciklusban történik: ha a
+validáció vagy maga a MySQL hibát jelez, a hibaszöveg visszakerül a modellhez,
+és legfeljebb két javító kör következik. Kapcsolati és időkorlát-hibánál nincs
+újratervezés, mert azt nem a terv okozta.
 
 ## ERGO Knowledge Pack és használat közbeni fejlesztés
 
@@ -136,9 +170,31 @@ regressziós teszttel kerül az alkalmazásba.
 Az OpenAI Responses API lekérdezési tervei szigorú JSON-sémát használnak, így
 az ERGO csak a várt SQL-, cím-, vizualizáció- és sorszámmezőket fogadja el.
 
+A reasoning modellek a kimeneti tokenkorlátot a belső gondolkodással együtt
+költik el, ezért az ERGO explicit reasoning effortot állít be (tervezéshez
+közepes, javító körhöz magas, összefoglalóhoz alacsony), és reális kimeneti
+plafonnal dolgozik. Ha a válasz mégis a plafon miatt lenne csonka, az ERGO
+megemelt kerettel egyszer újrapróbálja, és csak utána jelez hibát — korábban a
+csonka válasz észrevétlenül, lapos összefoglalóként jutott a felhasználóhoz.
+
 Az eredménykártya megmutatja a kiválasztott és teljes séma méretét, valamint az
 OpenAI által visszaadott input-, output- és cache-tokenek számát. A második,
-összefoglaló AI-hívás legfeljebb 40 eredménysort és 18 000 karaktert kap meg.
+összefoglaló AI-hívás legfeljebb 40 eredménysort és 18 000 karaktert kap meg,
+emellett megkapja a lefuttatott SQL-t, a plan címét, az oszlopneveket, az
+időszak feloldását és a beszélgetés utolsó fordulóit. Az összegeket, átlagokat
+és szélsőértékeket nem a modell számolja: az ERGO determinisztikusan, a teljes
+visszaadott eredményhalmazon számolja ki, és készen adja át. Így a 40 soros
+előnézet már nem vezethet téves összesítéshez.
+
+## Elemzési időablak és kifejezetten kért időszak
+
+A fejlécben választott 1, 3 vagy 5 FY-s időablak az alapértelmezés. Ha a kérdés
+kifejezetten megnevez egy azon kívüli évet, az a megnevezett időszak
+felülírja az ablakot: az ERGO arra az időszakra futtatja a lekérdezést, és az
+összefoglalóban ki is mondja. Korábban az ablak akkor is szűkített, ha a
+felhasználó tágabb időszakot kért, ezért az app csendben rossz vagy üres
+választ adott. Az összefoglaló azt is jelzi, hogy a záró év még nem zárt teljes
+év, így a trendösszehasonlítás részleges évet tartalmaz.
 
 Más OpenAI-kompatibilis szolgáltatás használatakor az API-címet és a modell
 azonosítóját a kapcsolati beállításokban kell módosítani.

@@ -1,7 +1,8 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, HashSet},
+    collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet},
     fs,
+    hash::{Hash, Hasher},
     path::PathBuf,
     process::Command,
     sync::{Mutex, OnceLock},
@@ -25,9 +26,37 @@ const AI_API_KEY_ACCOUNT: &str = "ai-api-key";
 const MAX_RESULT_ROWS: usize = 200;
 const MAX_SCHEMA_TABLES_PER_QUESTION: usize = 8;
 const MAX_SCHEMA_COLUMNS_PER_TABLE: usize = 36;
+/// Ezek a táblák minden dinamikus kérdésnél bekerülnek a sémarészletbe.
+const SCHEMA_CORE_TABLES: &[&str] = &[
+    "invoice",
+    "invoiceline",
+    "customer",
+    "endcustomer",
+    "customerentry",
+];
 const SCHEMA_CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_SAMPLED_COLUMNS: usize = 80;
+const MAX_SAMPLES_PER_COLUMN: usize = 10;
+const MAX_SAMPLE_CHARACTERS: usize = 40;
+const SAMPLE_SCAN_ROWS: usize = 5_000;
+const SAMPLE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const TOTAL_SAMPLING_BUDGET: Duration = Duration::from_secs(30);
 const SUMMARY_PREVIEW_ROWS: usize = 40;
 const SUMMARY_PREVIEW_CHARACTERS: usize = 18_000;
+const PLANNER_MAX_OUTPUT_TOKENS: u32 = 8_000;
+const SUMMARY_MAX_OUTPUT_TOKENS: u32 = 4_000;
+const MAX_OUTPUT_TOKEN_RETRY_FACTOR: u32 = 2;
+/// A reasoning modellek lassabbak, mint a korábbi 55 másodperces korlát.
+const AI_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+/// Az első terv plusz két javító kör a validációs és a MySQL-hibákra.
+const MAX_PLAN_ATTEMPTS: usize = 3;
+/// Az agentikus tervezés körkorlátja és eszközköltségei.
+const MAX_PLANNER_TOOL_ROUNDS: usize = 8;
+const MAX_PROBE_QUERIES: usize = 5;
+const PROBE_QUERY_ROWS: usize = 20;
+const PROBE_RESULT_CHARACTERS: usize = 4_000;
+const SEARCH_SCHEMA_MAX_TABLES: usize = 10;
+const SEARCH_SCHEMA_MAX_COLUMNS: usize = 20;
 const FEEDBACK_EMAIL: &str = "marton.trautmann@icloud.com";
 
 fn default_analysis_fy_window() -> u8 {
@@ -278,6 +307,18 @@ struct AnalysisFeedbackRecord {
 
 static KNOWLEDGE_PACK: OnceLock<KnowledgePack> = OnceLock::new();
 static FEEDBACK_FILE_LOCK: Mutex<()> = Mutex::new(());
+static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+
+/// Egyetlen, újrahasznosított kliens: a kérdésenkénti új TLS-kézfogás
+/// és a hiányzó kapcsolatpool több száz milliszekundumot vitt el.
+fn http_client() -> &'static Client {
+    HTTP_CLIENT.get_or_init(|| {
+        Client::builder()
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .unwrap_or_default()
+    })
+}
 
 fn knowledge_pack() -> &'static KnowledgePack {
     KNOWLEDGE_PACK.get_or_init(|| {
@@ -682,6 +723,12 @@ struct CatalogColumn {
     column_type: String,
     nullable: bool,
     key: String,
+    /// Tényleges adatbázis-értékek kis kardinalitású kód-, státusz- és
+    /// dátummezőkre. Enélkül a modell nem tudhatta meg, mit jelent a
+    /// `debitcredit`, vagy hogy az `invoicedate` valóban YYYY.MM.DD-e.
+    /// `default`: a korábban gyorsítótárazott katalógusok is betölthetők.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    samples: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1193,7 +1240,7 @@ async fn list_ai_models(app: AppHandle) -> Result<Vec<String>, String> {
     let endpoint = format!("{}/models", settings.ai_base_url.trim_end_matches('/'));
     let response = timeout(
         Duration::from_secs(15),
-        Client::new().get(endpoint).bearer_auth(api_key).send(),
+        http_client().get(endpoint).bearer_auth(api_key).send(),
     )
     .await
     .map_err(|_| "A modelllista lekérése időtúllépés miatt megszakadt.".to_string())?
@@ -1217,6 +1264,35 @@ async fn list_ai_models(app: AppHandle) -> Result<Vec<String>, String> {
     models.sort();
     models.dedup();
     Ok(models)
+}
+
+/// Újrahasznosított kapcsolatpool a lekérdezési utakhoz. Korábban minden
+/// kérdés új poolt épített és azonnal szét is kapcsolta, így a kapcsolatpool
+/// sosem fejtett ki hatást.
+fn cached_database_pool(settings: &StoredSettings, password: &str) -> Pool {
+    static POOLS: OnceLock<Mutex<HashMap<u64, Pool>>> = OnceLock::new();
+    let mut hasher = DefaultHasher::new();
+    settings.mysql_host.hash(&mut hasher);
+    settings.mysql_port.hash(&mut hasher);
+    settings.mysql_database.hash(&mut hasher);
+    settings.mysql_user.hash(&mut hasher);
+    settings.mysql_ssl.hash(&mut hasher);
+    // A jelszó is a kulcs része, hogy jelszócsere után ne maradjon
+    // használatban a régi beállításokkal felépített pool.
+    password.hash(&mut hasher);
+    let key = hasher.finish();
+
+    let pools = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match pools.lock() {
+        Ok(guard) => guard,
+        // Megmérgezett zár esetén inkább egyszer használatos poolt adunk,
+        // mint hogy a lekérdezés elhasaljon.
+        Err(_) => return database_pool(settings, password.to_string()),
+    };
+    guard
+        .entry(key)
+        .or_insert_with(|| database_pool(settings, password.to_string()))
+        .clone()
 }
 
 fn database_pool(settings: &StoredSettings, password: String) -> Pool {
@@ -1276,7 +1352,7 @@ async fn inspect_schema_catalog(
     settings: &StoredSettings,
     password: String,
 ) -> Result<SchemaCatalog, String> {
-    let pool = database_pool(settings, password);
+    let pool = cached_database_pool(settings, &password);
     let mut connection = timeout(Duration::from_secs(12), pool.get_conn())
         .await
         .map_err(|_| "Az adatbázis-kapcsolat időtúllépés miatt megszakadt.".to_string())?
@@ -1314,9 +1390,6 @@ async fn inspect_schema_catalog(
         )
         .await
         .map_err(|error| format!("A kapcsolati metaadatok nem olvashatók: {error}"))?;
-    drop(connection);
-    pool.disconnect().await.ok();
-
     let mut tables = table_rows
         .into_iter()
         .map(|row| {
@@ -1342,6 +1415,7 @@ async fn inspect_schema_catalog(
                 column_type: row.get::<String, _>("COLUMN_TYPE").unwrap_or_default(),
                 nullable: row.get::<String, _>("IS_NULLABLE").unwrap_or_default() == "YES",
                 key: row.get::<String, _>("COLUMN_KEY").unwrap_or_default(),
+                samples: Vec::new(),
             });
         }
     }
@@ -1361,6 +1435,9 @@ async fn inspect_schema_catalog(
         }
     }
 
+    collect_column_samples(&mut connection, &mut tables).await;
+    drop(connection);
+
     Ok(SchemaCatalog {
         database: settings.mysql_database.clone(),
         source: format!(
@@ -1373,6 +1450,108 @@ async fn inspect_schema_catalog(
             .as_secs(),
         tables: tables.into_values().collect(),
     })
+}
+
+/// Az `information_schema` nem mondja meg, hogy a `debitcredit` értéke 0/1
+/// vagy D/C, és hogy az `invoicedate` varchar mezőben pont vagy kötőjel
+/// választja-e el a dátumot. Ezt csak tényleges adatból lehet megtudni.
+///
+/// A mintavétel szándékosan szűk: korlátozott ablakból olvas (nem fut
+/// teljes táblaszkennt a replikán), legfeljebb `MAX_SAMPLED_COLUMNS`
+/// oszlopot vizsgál, és minden hiba csendben kimarad — a séma akkor is
+/// használható, ha a mintavétel nem sikerül.
+async fn collect_column_samples(
+    connection: &mut mysql_async::Conn,
+    tables: &mut BTreeMap<String, SchemaTable>,
+) {
+    let identifier = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid identifier regex");
+    let mut probes = Vec::new();
+    for (table_name, table) in tables.iter() {
+        if table.table_type != "BASE TABLE" || !identifier.is_match(table_name) {
+            continue;
+        }
+        for column in &table.columns {
+            if !identifier.is_match(&column.name) || !is_sampleable_column(column) {
+                continue;
+            }
+            probes.push((table_name.clone(), column.name.clone()));
+        }
+    }
+    probes.truncate(MAX_SAMPLED_COLUMNS);
+
+    let sampling_started = SystemTime::now();
+    for (table_name, column_name) in probes {
+        // A sémafrissítés egy felhasználói kérdés közben fut, ezért a
+        // mintavétel összesített ideje is korlátos.
+        if sampling_started
+            .elapsed()
+            .is_ok_and(|elapsed| elapsed >= TOTAL_SAMPLING_BUDGET)
+        {
+            break;
+        }
+        // A belső LIMIT tartja korlátok között az olvasást: kódmezőknél egy
+        // néhány ezer soros ablak is megmutatja az előforduló értékeket.
+        let sql = format!(
+            "SELECT DISTINCT `{column_name}` AS sample_value \
+             FROM (SELECT `{column_name}` FROM `{table_name}` LIMIT {SAMPLE_SCAN_ROWS}) AS sample_window \
+             WHERE `{column_name}` IS NOT NULL LIMIT {}",
+            MAX_SAMPLES_PER_COLUMN + 1
+        );
+        let sampled = timeout(SAMPLE_QUERY_TIMEOUT, connection.query::<Row, _>(sql)).await;
+        let Ok(Ok(rows)) = sampled else { continue };
+        if rows.len() > MAX_SAMPLES_PER_COLUMN {
+            // Nagy kardinalitású mező: a felsorolás nem mond semmit.
+            continue;
+        }
+        let mut values = rows
+            .iter()
+            .map(|row| match mysql_value_to_json(row.as_ref(0)) {
+                JsonValue::String(text) => text,
+                other => other.to_string(),
+            })
+            .filter(|value| !value.is_empty() && value.chars().count() <= MAX_SAMPLE_CHARACTERS)
+            .collect::<Vec<_>>();
+        values.sort();
+        values.dedup();
+        if values.is_empty() {
+            continue;
+        }
+        if let Some(column) = tables
+            .get_mut(&table_name)
+            .and_then(|table| table.columns.iter_mut().find(|c| c.name == column_name))
+        {
+            column.samples = values;
+        }
+    }
+}
+
+/// Kód-, státusz-, jelző- és dátummezők, ahol a tényleges érték számít.
+/// A szabad szöveget és a nagy mezőket kihagyjuk.
+fn is_sampleable_column(column: &CatalogColumn) -> bool {
+    let column_type = column.column_type.to_ascii_lowercase();
+    if ["text", "blob", "json", "binary"]
+        .iter()
+        .any(|excluded| column_type.contains(excluded))
+    {
+        return false;
+    }
+    let name = column.name.to_ascii_lowercase();
+    [
+        "companynumber",
+        "credit",
+        "currency",
+        "date",
+        "debit",
+        "flag",
+        "kind",
+        "openclosed",
+        "posted",
+        "status",
+        "type",
+        "unit",
+    ]
+    .iter()
+    .any(|fragment| name.contains(fragment))
 }
 
 async fn load_schema_catalog(
@@ -2094,20 +2273,19 @@ fn select_schema_context(
         .take(MAX_SCHEMA_TABLES_PER_QUESTION)
         .map(|(_, table)| *table)
         .collect::<Vec<_>>();
-    if selected.is_empty() {
-        let fallbacks = [
-            "invoice",
-            "invoiceline",
-            "customer",
-            "customerentry",
-            "jobheader",
-            "orderheader",
-            "financeentry",
-        ];
-        selected = fallbacks
-            .iter()
-            .filter_map(|name| catalog.tables.iter().find(|table| table.name == *name))
-            .collect();
+    // A kulcsszavas pontozás tévedhet, és a modell nem kérhet pótlást: egy
+    // félig találó, irreleváns tábla rosszabb, mint a biztos mag. Ezért a
+    // magot MINDIG hozzáfűzzük, nem csak nulla találat esetén.
+    for name in SCHEMA_CORE_TABLES {
+        if selected.len() >= MAX_SCHEMA_TABLES_PER_QUESTION + SCHEMA_CORE_TABLES.len() {
+            break;
+        }
+        if selected.iter().any(|table| table.name == *name) {
+            continue;
+        }
+        if let Some(table) = catalog.tables.iter().find(|table| table.name == *name) {
+            selected.push(table);
+        }
     }
 
     let analytical_fragments = [
@@ -2141,8 +2319,20 @@ fn select_schema_context(
         "vendor",
     ];
     let mut context = String::from(
-        "Csak az alábbi, kérdéshez helyben kiválasztott MySQL-séma használható. A dátum mezők formátumát ne feltételezd; szükség esetén szövegként kezeld.\n",
+        "Az alábbi, kérdéshez helyben kiválasztott MySQL-sémarészlet oszlopai használhatók. A mintaértékek tényleges adatbázis-tartalomból származnak.\n",
     );
+    // A modell eddig nem tudta, mit NEM kapott meg. A puszta táblanévlista
+    // néhány száz token, és megakadályozza a nem létező tábla kitalálását.
+    context.push_str(&format!(
+        "\nAz adatbázis összes táblája (csak tájékozódásra, oszlopok nélkül):\n{}\n",
+        catalog
+            .tables
+            .iter()
+            .map(|table| table.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    context.push_str("\nRészletes sémarészlet:\n");
     let mut selected_columns = 0;
     for table in &selected {
         let relationship_columns = table
@@ -2220,7 +2410,15 @@ fn select_schema_context(
                 } else {
                     format!("[{}]", flags.join(","))
                 };
-                format!("{}:{}{}", column.name, column.column_type, suffix)
+                let samples = if column.samples.is_empty() {
+                    String::new()
+                } else {
+                    format!(" példaértékek: {}", column.samples.join(" | "))
+                };
+                format!(
+                    "{}:{}{}{}",
+                    column.name, column.column_type, suffix, samples
+                )
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -2423,53 +2621,406 @@ fn mysql_value_to_json(value: Option<&Value>) -> JsonValue {
     }
 }
 
+/// A planner promptjának kérdéstől független része. Egyszer épül fel, és
+/// szó szerint azonos minden hívásban, hogy a prompt-cache illeszkedni
+/// tudjon rá — korábban a dinamikus mezők a prompt közepén ültek, és
+/// gyakorlatilag minden kérdés cache-tévesztéssel indult.
+fn planner_static_instructions() -> &'static str {
+    static INSTRUCTIONS: OnceLock<String> = OnceLock::new();
+    INSTRUCTIONS.get_or_init(|| {
+        let mut instructions = String::from(
+            r#"Te az ERGO, a Trans-Europe óvatos ERP-adatelemzője vagy.
+Magyarul és angolul is értelmezd a kérdéseket. A title mezőt a kérdés nyelvén add meg.
+Készíts pontos MySQL lekérdezési tervet a megadott adatbázis-séma alapján.
+Kizárólag egy SELECT vagy WITH lekérdezést adhatsz. Tilos minden adatmódosítás, DDL, zárolás, fájlművelet, komment, rendszer-séma és több utasítás.
+Az sql mező pontosan egyetlen SELECT vagy WITH utasítást tartalmazzon, záró pontosvessző nélkül. Ne használj SET, DECLARE, ideiglenes táblát vagy tárolt eljárást.
+Ne találj ki táblát vagy oszlopot. Használj explicit oszlopokat és aggregálj SQL-ben. A sorok száma legfeljebb 200 legyen.
+Az üzleti kategóriát és a táblaleírást tekintsd mérvadónak; az azonos szavakat tartalmazó, de más üzleti célú táblákat ne keverd össze.
+Kötelező árbevétel-definíció számlaadatok használatakor:
+- az árbevétel nettó számlázott árbevételt jelent a Trans Europe Zrt. vállalati alapdevizájában;
+- a Trans Europe Zrt. rekordjait companynumber = '1' azonosítja;
+- csak a posted = 1 könyvelt számlákat használd;
+- számlafejes összesítéshez invoice.itemsumbase mezőt használj, és a debitcredit = 1 jóváírásokat vond le;
+- cikkszintű elemzéshez invoiceline.linepricebase mezőt használj, az invoice táblához companynumber és invoicenumber alapján kapcsolva, hogy a könyveltséget és a jóváírás előjelét alkalmazhasd;
+- a vatbase áfaösszeg, soha ne nevezd vagy összegezd árbevételként;
+- eltérő invoice.currency értékeket ne add össze dokumentumdevizában; összehasonlításhoz a *base mezőket használd.
+Időfüggő üzleti adatoknál kötelező közvetlenül az SQL WHERE feltételében időszakot szűrni:
+- ha a kérdés napot vagy időszakot ad meg (például ma, tegnap, adott hónap), pontosan arra, és ne olvass be azon kívüli rekordot;
+- dátumként tárolt varchar mezőnél vedd figyelembe a sémában jelzett típust és a ponttal tagolt YYYY.MM.DD formátumot;
+- fejlécszámhoz ne kapcsolj tételtáblát, ha a kérdés nem kér tételszintű adatot.
+Vevői termékvásárlásnál ne keverd össze a számlázott vevőt/viszonteladót (invoice.customernumber -> customer.customernumber) a tényleges végfelhasználóval (endcustomernumber -> endcustomer.endcustomernumber). Ha a kérdés szerepe nem egyértelmű, ne válassz helyette: kérdezz vissza, hogy a számlázott viszonteladót/vevőt vagy a végfelhasználót keressük.
+A sémarészlet a kérdéshez helyben kiválasztott táblákat tartalmazza. Ha a feladathoz olyan tábla kell, amelyik csak a teljes táblalistában szerepel, oszlopokkal nem, akkor NE találd ki az oszlopneveit: adj olyan tervet, amely a megadott oszlopokkal megoldható, vagy kérdezz vissza.
+A mintaértékek tényleges adatbázis-tartalomból származnak: a kódok, státuszjelzők és dátumformátumok ellenőrzéséhez ezeket használd, ne a feltételezést.
+
+Ha eszközök állnak rendelkezésre, a tervezés menete:
+1. Ha a kérdéshez a sémarészletben nem szereplő tábla vagy oszlop kell, keresd meg a search_schema és describe_table eszközzel. Ne találd ki az oszlopnevet.
+2. Cégnevet mindig a resolve_entity eszközzel oldj fel, és add meg a szerepet; a számlázott vevőt és a végfelhasználót soha ne mosd össze.
+3. Bizonytalan join, dátumformátum vagy kódérték esetén futtass probe_query próbalekérdezést, és a visszakapott adatból dolgozz tovább.
+4. Végül a submit_plan eszközzel add be a végleges tervet. Csak ezzel fejezd be, szöveges válasszal ne.
+Ne hívj eszközt olyan információért, amit a sémarészlet vagy az üzleti tudás már megad.
+
+Helyi, verziózott ERP-tudás:
+"#,
+        );
+        instructions.push_str(&knowledge_prompt_context());
+        instructions.push_str(
+            r#"Kizárólag JSON objektummal válaszolj ebben az alakban:
+{"sql":"...","title":"rövid magyar cím","visualization":"table|bar|line","maxRows":50}"#,
+        );
+        instructions
+    })
+}
+
+/// A kérdésben kifejezetten megnevezett naptári évek.
+fn requested_years(question: &str) -> Vec<i64> {
+    let mut years = Regex::new(r"\b(19[89]\d|20[0-9]\d)\b")
+        .expect("valid year regex")
+        .find_iter(question)
+        .filter_map(|found| found.as_str().parse::<i64>().ok())
+        .collect::<Vec<_>>();
+    years.sort_unstable();
+    years.dedup();
+    years
+}
+
+/// Eldönti, hogy a kérdés kilép-e a beállított elemzési időablakból.
+/// Korábban a planner azt az utasítást kapta, hogy az ablakon kívüli
+/// tranzakciót akkor se használja, ha a felhasználó kifejezetten kéri —
+/// ettől az app csendben rossz vagy üres választ adott.
+struct PeriodScope {
+    window_start_year: i64,
+    window_end_year: i64,
+    outside_years: Vec<i64>,
+}
+
+impl PeriodScope {
+    fn resolve(question: &str, analysis_fy_window: u8) -> Self {
+        let (window_start_year, window_end_year) = fy_window_years(analysis_fy_window);
+        let outside_years = requested_years(question)
+            .into_iter()
+            .filter(|year| *year < window_start_year || *year > window_end_year)
+            .collect();
+        Self {
+            window_start_year,
+            window_end_year,
+            outside_years,
+        }
+    }
+
+    fn years_label(&self) -> String {
+        self.outside_years
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// A planner időszak-szabálya. Ha a felhasználó kifejezetten az ablakon
+    /// kívüli évet kért, azt az ablak felülírása helyett ki kell szolgálni.
+    fn planner_rule(&self, analysis_fy_window: u8, fiscal_year_start: &str) -> String {
+        if self.outside_years.is_empty() {
+            format!(
+                "- a beállított elemzési időablak {analysis_fy_window} FY ({}–{}); ennek kezdete {fiscal_year_start};\n\
+                 - külön megnevezett időszak hiányában ettől a kezdettől szűrj;\n\
+                 - ha a kérdés nem nevez meg időszakot, az időablaknál régebbi tranzakciót ne használj;",
+                self.window_start_year, self.window_end_year
+            )
+        } else {
+            format!(
+                "- a beállított elemzési időablak {analysis_fy_window} FY ({}–{}); a kérdésben ez a négyjegyű szám szerepel: {};\n\
+                 - ha ez a szám időszakra utal, akkor FELÜLÍRJA az időablakot: pontosan arra az időszakra szűrj, ne szűkítsd az ablakra, és azon kívüli rekordot ne olvass be;\n\
+                 - ha a szám nem időszak (például mennyiség, cikkszám vagy azonosító), hagyd figyelmen kívül, és az időablakot használd;",
+                self.window_start_year,
+                self.window_end_year,
+                self.years_label()
+            )
+        }
+    }
+
+    /// Az összefoglaló ebből tudja meg, mekkora időszakot látott valójában.
+    fn summary_note(&self, analysis_fy_window: u8) -> String {
+        if self.outside_years.is_empty() {
+            format!(
+                "Időszak: a kérdés nem nevezett meg az időablakon kívüli évet, ezért a {analysis_fy_window} FY ablak ({}–{}) érvényes. A záró {} év még nem zárt teljes év, ezért a részleges évet trendösszehasonlításnál mondd ki.",
+                self.window_start_year, self.window_end_year, self.window_end_year
+            )
+        } else {
+            format!(
+                "Időszak: a kérdésben szerepel a(z) {} szám, ami az elemzési {analysis_fy_window} FY ablakon ({}–{}) kívüli évre utalhat. Ha a lekérdezés tényleg arra az időszakra szűrt, akkor az időablak nem szűkítette az eredményt — a lefuttatott SQL WHERE feltételéből ellenőrizd, és a válaszban a tényleges időszakot mondd ki.",
+                self.years_label(),
+                self.window_start_year,
+                self.window_end_year
+            )
+        }
+    }
+}
+
+/// Mindaz, amiből az összefoglaló meg tudja ítélni, hogy a lefuttatott
+/// lekérdezés tényleg a feltett kérdést válaszolja-e meg.
+struct SummaryContext<'a> {
+    question: &'a str,
+    title: &'a str,
+    sql: &'a str,
+    columns: &'a [String],
+    rows: &'a [JsonValue],
+    truncated: bool,
+    analysis_fy_window: u8,
+    fy_window_start: String,
+    /// Kimondja, ha a kérdés az időablakon kívülre mutatott.
+    period_note: String,
+    /// A feloldott vevő/végfelhasználó kódjai, ha volt feloldás.
+    entity_note: Option<String>,
+    history: &'a [HistoryMessage],
+}
+
+fn recent_history_text(
+    history: &[HistoryMessage],
+    turns: usize,
+    characters_per_turn: usize,
+) -> String {
+    let mut recent = history
+        .iter()
+        .filter(|message| message.role == "user" || message.role == "assistant")
+        .rev()
+        .take(turns)
+        .collect::<Vec<_>>();
+    recent.reverse();
+    recent
+        .into_iter()
+        .map(|message| {
+            let compact = message
+                .content
+                .chars()
+                .take(characters_per_turn)
+                .collect::<String>();
+            format!("{}: {compact}", message.role)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Naptári dátum az epoch-másodpercből, Howard Hinnant `civil_from_days`
+/// algoritmusával. Csak ezért nem érdemes dátumkönyvtárat behúzni.
+fn civil_date_from_unix(seconds: i64) -> (i64, u32, u32) {
+    let days = seconds.div_euclid(86_400);
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_position = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_position + 2) / 5 + 1) as u32;
+    let month = if month_position < 10 {
+        month_position + 3
+    } else {
+        month_position - 9
+    } as u32;
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
+}
+
+fn today_date() -> (i64, u32, u32) {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    civil_date_from_unix(seconds)
+}
+
+/// Az elemzési időablak első és utolsó naptári éve. Az ERP az FY-t naptári
+/// évként kezeli, ezért a záró év a folyó, még nem zárt év.
+fn fy_window_years(analysis_fy_window: u8) -> (i64, i64) {
+    let (current_year, _, _) = today_date();
+    (
+        current_year - i64::from(analysis_fy_window.saturating_sub(1)),
+        current_year,
+    )
+}
+
+/// A MySQL a DECIMAL és DATE oszlopokat szövegként adja vissza, ezért a
+/// számértéket a JSON-stringekből is ki kell nyerni.
+fn numeric_value(value: &JsonValue) -> Option<f64> {
+    match value {
+        JsonValue::Number(number) => number.as_f64(),
+        JsonValue::String(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn format_amount(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 1e15 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+/// Determinisztikus, a **teljes** visszaadott eredményhalmazon számolt
+/// összesítés. A modell így nem a 40 soros előnézetből próbál összegezni.
+fn result_statistics(columns: &[String], rows: &[JsonValue]) -> String {
+    if rows.is_empty() || columns.is_empty() {
+        return "Nincs összesíthető sor.".into();
+    }
+
+    let mut lines = Vec::new();
+    for column in columns {
+        let values = rows
+            .iter()
+            .filter_map(|row| row.get(column))
+            .filter(|value| !value.is_null())
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            lines.push(format!(
+                "- {column}: minden értéke NULL ({} sor)",
+                rows.len()
+            ));
+            continue;
+        }
+
+        let numbers = values
+            .iter()
+            .filter_map(|value| numeric_value(value))
+            .collect::<Vec<_>>();
+        if numbers.len() == values.len() {
+            let sum = numbers.iter().sum::<f64>();
+            let min = numbers.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = numbers.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let average = sum / numbers.len() as f64;
+            lines.push(format!(
+                "- {column} (numerikus, {} érték): összeg {}, átlag {}, min {}, max {}",
+                numbers.len(),
+                format_amount(sum),
+                format_amount(average),
+                format_amount(min),
+                format_amount(max)
+            ));
+            continue;
+        }
+
+        let texts = values
+            .iter()
+            .map(|value| match value {
+                JsonValue::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let distinct = texts.iter().collect::<HashSet<_>>();
+        let mut sorted = texts.clone();
+        sorted.sort();
+        let mut line = format!(
+            "- {column} (szöveges, {} érték, {} különböző)",
+            texts.len(),
+            distinct.len()
+        );
+        if distinct.len() <= 8 {
+            let mut labels = distinct.into_iter().cloned().collect::<Vec<_>>();
+            labels.sort();
+            line.push_str(&format!(": {}", labels.join(" | ")));
+        } else if let (Some(first), Some(last)) = (sorted.first(), sorted.last()) {
+            line.push_str(&format!(": rendezve {first} … {last}"));
+        }
+        lines.push(line);
+    }
+
+    format!(
+        "Sorok száma: {}\nOszloponkénti összesítés a TELJES visszaadott eredményen:\n{}",
+        rows.len(),
+        lines.join("\n")
+    )
+}
+
+/// A lekérdezés kudarcának oka. Csak a `Sql` változatot érdemes a modellel
+/// javíttatni; a kapcsolati és időkorlát-hibák újratervezéssel nem múlnak el.
+enum QueryFailure {
+    Sql(String),
+    Infrastructure(String),
+}
+
+impl QueryFailure {
+    fn message(self) -> String {
+        match self {
+            Self::Sql(message) | Self::Infrastructure(message) => message,
+        }
+    }
+}
+
 async fn run_query(
     settings: &StoredSettings,
     password: String,
     sql: &str,
     max_rows: usize,
 ) -> Result<(Vec<String>, Vec<JsonValue>, bool), String> {
-    let normalized = assert_read_only_sql(sql)?;
+    run_query_classified(settings, password, sql, max_rows)
+        .await
+        .map_err(QueryFailure::message)
+}
+
+async fn run_query_classified(
+    settings: &StoredSettings,
+    password: String,
+    sql: &str,
+    max_rows: usize,
+) -> Result<(Vec<String>, Vec<JsonValue>, bool), QueryFailure> {
+    let normalized = assert_read_only_sql(sql).map_err(QueryFailure::Sql)?;
     let applied_limit = max_rows.clamp(1, MAX_RESULT_ROWS);
     let wrapped = format!(
         "SELECT * FROM ({normalized}) AS ergo_readonly_query LIMIT {}",
         applied_limit + 1
     );
-    let pool = database_pool(settings, password);
+    let pool = cached_database_pool(settings, &password);
     let mut connection = timeout(Duration::from_secs(12), pool.get_conn())
         .await
-        .map_err(|_| "Az adatbázis-kapcsolat időtúllépés miatt megszakadt.".to_string())?
-        .map_err(|error| format!("A MySQL-szerver nem érhető el: {error}"))?;
+        .map_err(|_| {
+            QueryFailure::Infrastructure(
+                "Az adatbázis-kapcsolat időtúllépés miatt megszakadt.".into(),
+            )
+        })?
+        .map_err(|error| {
+            QueryFailure::Infrastructure(format!("A MySQL-szerver nem érhető el: {error}"))
+        })?;
     connection
         .query_drop("START TRANSACTION READ ONLY")
         .await
-        .map_err(|error| format!("A csak olvasható tranzakció nem indítható: {error}"))?;
+        .map_err(|error| {
+            QueryFailure::Infrastructure(format!(
+                "A csak olvasható tranzakció nem indítható: {error}"
+            ))
+        })?;
 
-    let query_result = timeout(Duration::from_secs(30), connection.query::<Row, _>(wrapped)).await;
-    let rows = match query_result {
-        Ok(Ok(rows)) => rows,
+    let started = timeout(Duration::from_secs(30), async {
+        let mut query_result = connection.query_iter(wrapped).await?;
+        // Az oszlopneveket a sorok begyűjtése előtt kell kiolvasni: üres
+        // eredménynél csak így marad meg, mit is kérdeztünk le.
+        let columns = query_result
+            .columns_ref()
+            .iter()
+            .map(|column| column.name_str().into_owned())
+            .collect::<Vec<_>>();
+        let rows = query_result.collect::<Row>().await?;
+        Ok::<_, mysql_async::Error>((columns, rows))
+    })
+    .await;
+
+    let (columns, rows) = match started {
+        Ok(Ok(result)) => result,
         Ok(Err(error)) => {
             connection.query_drop("ROLLBACK").await.ok();
-            return Err(format!("Az ERP-lekérdezés sikertelen: {error}"));
+            return Err(QueryFailure::Sql(format!(
+                "Az ERP-lekérdezés sikertelen: {error}"
+            )));
         }
         Err(_) => {
             connection.query_drop("ROLLBACK").await.ok();
-            return Err("Az ERP-lekérdezés 30 másodperces időkorlátja lejárt.".into());
+            return Err(QueryFailure::Infrastructure(
+                "Az ERP-lekérdezés 30 másodperces időkorlátja lejárt.".into(),
+            ));
         }
     };
     connection.query_drop("COMMIT").await.ok();
     drop(connection);
-    pool.disconnect().await.ok();
 
-    let columns = rows
-        .first()
-        .map(|row| {
-            row.columns_ref()
-                .iter()
-                .map(|column| column.name_str().into_owned())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     let truncated = rows.len() > applied_limit;
     let serialized = rows
         .into_iter()
@@ -2506,15 +3057,568 @@ fn responses_input(user: &str, json_mode: bool) -> String {
     }
 }
 
+/// A Responses API-t használó modellcsalád. Az eszközös tervezés ennek a
+/// function callingjára épül, ezért a chat/completions modellek a korábbi
+/// egylövésű úton maradnak.
+fn uses_responses_api(settings: &StoredSettings) -> bool {
+    settings.ai_model.starts_with("gpt-5") || settings.ai_model.starts_with("gpt-6")
+}
+
+/// A reasoning modellek a `max_output_tokens` plafont a belső gondolkodással
+/// együtt költik el, és csak explicit `effort` mellett kiszámítható a budget.
+fn supports_reasoning_effort(model: &str) -> bool {
+    let reasoning_family = model.starts_with("gpt-5")
+        || model.starts_with("gpt-6")
+        || model
+            .strip_prefix('o')
+            .and_then(|suffix| suffix.chars().next())
+            .is_some_and(|character| character.is_ascii_digit());
+    reasoning_family && !model.contains("chat")
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AiCallOptions {
+    json_mode: bool,
+    reasoning_effort: &'static str,
+    max_output_tokens: u32,
+}
+
+impl AiCallOptions {
+    const fn planner() -> Self {
+        Self {
+            json_mode: true,
+            reasoning_effort: "medium",
+            max_output_tokens: PLANNER_MAX_OUTPUT_TOKENS,
+        }
+    }
+
+    /// A javító kör már egyszer elhasalt az ellenőrzésen, ezért több
+    /// gondolkodást kap, mint az első terv.
+    const fn repair() -> Self {
+        Self {
+            reasoning_effort: "high",
+            ..Self::planner()
+        }
+    }
+
+    const fn summary() -> Self {
+        Self {
+            json_mode: false,
+            reasoning_effort: "low",
+            max_output_tokens: SUMMARY_MAX_OUTPUT_TOKENS,
+        }
+    }
+}
+
+/// `None`, ha a válasz azért lett csonka, mert elfogyott a kimeneti budget.
+/// Ilyenkor a hívó megemelt plafonnal újrapróbálja.
+enum AiCallOutcome {
+    Complete(AiCallResult),
+    OutOfOutputBudget,
+}
+
+/// Agentikus tervezés: a modell eszközökkel nézhet utána a sémának, a
+/// kódértékeknek és a tényleges adatnak, mielőtt végleges tervet ad.
+///
+/// Ez zárja be a szakadékot az egylövésű pipeline és a plugin-változat
+/// között: utóbbi pontosan ezért adott jobb válaszokat ugyanazzal a
+/// modellel. A biztonsági határ nem változik — a végleges SQL ugyanazon a
+/// `validate_planned_sql` ellenőrzésen megy át, a próbalekérdezések pedig
+/// a `assert_read_only_sql` őr mögött futnak.
+async fn plan_with_tools(
+    settings: &StoredSettings,
+    api_key: &str,
+    system: &str,
+    planner_user: &str,
+    catalog: &SchemaCatalog,
+    password: &str,
+) -> Result<(QueryPlan, TokenUsage), String> {
+    let endpoint = format!("{}/responses", settings.ai_base_url.trim_end_matches('/'));
+    let options = AiCallOptions::planner();
+    let mut input = vec![json!({ "role": "user", "content": planner_user })];
+    let mut usage = TokenUsage::default();
+    let mut probes_left = MAX_PROBE_QUERIES;
+
+    for round in 1..=MAX_PLANNER_TOOL_ROUNDS {
+        let mut request = json!({
+            "model": settings.ai_model,
+            "instructions": system,
+            "input": input,
+            "tools": planner_tools(),
+            "tool_choice": "required",
+            "max_output_tokens": options.max_output_tokens,
+            "store": false
+        });
+        if supports_reasoning_effort(&settings.ai_model) {
+            request["reasoning"] = json!({ "effort": options.reasoning_effort });
+        }
+
+        let response = post_ai_request(api_key, &endpoint, &request).await?;
+        usage.add(&responses_usage(&response));
+
+        match response["status"].as_str() {
+            Some("incomplete") => {
+                return Err(format!(
+                    "Az AI a tervezés {round}. körében nem fejezte be a választ ({}).",
+                    response["incomplete_details"]["reason"]
+                        .as_str()
+                        .unwrap_or("ismeretlen ok")
+                ));
+            }
+            Some("failed") => {
+                return Err(format!(
+                    "Az AI-hívás sikertelen a tervezés {round}. körében: {}",
+                    response["error"]["message"]
+                        .as_str()
+                        .unwrap_or("ismeretlen hiba")
+                ));
+            }
+            _ => {}
+        }
+
+        let output = response["output"].as_array().cloned().unwrap_or_default();
+        let calls = output
+            .iter()
+            .filter(|item| item["type"].as_str() == Some("function_call"))
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
+            return Err(
+                "Az AI nem adott végleges lekérdezési tervet és eszközt sem hívott.".into(),
+            );
+        }
+
+        // A végleges terv zárja a ciklust, a többi hívás a feltárás.
+        if let Some(submitted) = calls
+            .iter()
+            .find(|call| call["name"].as_str() == Some("submit_plan"))
+        {
+            let arguments = submitted["arguments"].as_str().unwrap_or("{}");
+            let plan: QueryPlan = extract_json(arguments)?;
+            return Ok((plan, usage));
+        }
+
+        // A következő kör bemenetének tartalmaznia kell a modell saját
+        // eszközhívásait, különben nem tudja hova kötni az eredményt.
+        // Csak azokat: `store: false` mellett a reasoning elem visszaadása
+        // titkosított tartalom nélkül érvénytelen bemenet.
+        input.extend(calls.iter().map(|call| (*call).clone()));
+        for call in calls {
+            let name = call["name"].as_str().unwrap_or_default();
+            let arguments = call["arguments"].as_str().unwrap_or("{}");
+            let result = execute_planner_tool(
+                name,
+                arguments,
+                catalog,
+                settings,
+                password,
+                &mut probes_left,
+            )
+            .await;
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call["call_id"].as_str().unwrap_or_default(),
+                "output": result
+            }));
+        }
+    }
+
+    Err(format!(
+        "Az AI {MAX_PLANNER_TOOL_ROUNDS} körben sem jutott el a végleges lekérdezési tervig."
+    ))
+}
+
+/// A planner eszközei. Eddig a modell egyetlen lövésből, a kulcsszavas
+/// heurisztika által kiválasztott sémarészletből dolgozott: ha a válogatás
+/// tévedett, esélye sem volt jó tervet adni. Ezekkel az eszközökkel maga
+/// nézhet utána a sémának, a kódértékeknek és a tényleges adatnak.
+fn planner_tools() -> JsonValue {
+    json!([
+        {
+            "type": "function",
+            "name": "search_schema",
+            "description": "Táblák és oszlopok keresése a teljes adatbázis-katalógusban. Rövid, célzott kifejezéseket adj meg (például \"invoice invoiceline itemnumber\"), ne a teljes kérdést.",
+            "strict": true,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "terms": {
+                        "type": "string",
+                        "description": "Szóközzel elválasztott keresőkifejezések tábla- és oszlopnevekre."
+                    }
+                },
+                "required": ["terms"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "describe_table",
+            "description": "Egy tábla összes oszlopa, típusa, kulcsai, idegen kulcsai és a kis kardinalitású mezők tényleges mintaértékei.",
+            "strict": true,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table": { "type": "string", "description": "A tábla pontos neve." }
+                },
+                "required": ["table"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "resolve_entity",
+            "description": "Cégnév feloldása ellenőrzött ERP-kódokra. A számlázott vevő és a végfelhasználó két külön törzs, ezért a szerepet meg kell adni.",
+            "strict": true,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "A keresett cég neve a kérdésből." },
+                    "role": {
+                        "type": "string",
+                        "enum": ["end_customer", "billed_customer"],
+                        "description": "end_customer = tényleges végfelhasználó, billed_customer = számlázott vevő/viszonteladó."
+                    }
+                },
+                "required": ["name", "role"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "submit_plan",
+            "description": "A VÉGLEGES lekérdezési terv beadása. Csak akkor hívd, ha az oszlopneveket és a szükséges kódértékeket már ellenőrizted. Ezzel a tervezés befejeződik.",
+            "strict": true,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {
+                        "type": "string",
+                        "description": "Egyetlen SELECT vagy WITH utasítás, záró pontosvessző nélkül."
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Rövid cím a kérdés nyelvén."
+                    },
+                    "visualization": {
+                        "type": "string",
+                        "enum": ["table", "bar", "line"]
+                    },
+                    "maxRows": { "type": "integer", "minimum": 1, "maximum": 200 }
+                },
+                "required": ["sql", "title", "visualization", "maxRows"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "probe_query",
+            "description": "Próbalekérdezés futtatása a tervezés közben, legfeljebb néhány soros eredménnyel. Arra való, hogy ellenőrizd a join-t, a dátumformátumot vagy a kódértékeket, MIELŐTT végleges tervet adsz. Csak SELECT vagy WITH.",
+            "strict": true,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {
+                        "type": "string",
+                        "description": "Egyetlen SELECT vagy WITH utasítás, záró pontosvessző nélkül."
+                    }
+                },
+                "required": ["sql"],
+                "additionalProperties": false
+            }
+        }
+    ])
+}
+
+/// Egy eszközhívás végrehajtása. A visszaadott szöveg a modellhez kerül,
+/// ezért a hibát is olvasható mondatként adjuk vissza, nem hibaként felfelé:
+/// a modellnek abból kell tanulnia, nem a kérdésnek elhasalnia.
+async fn execute_planner_tool(
+    name: &str,
+    arguments: &str,
+    catalog: &SchemaCatalog,
+    settings: &StoredSettings,
+    password: &str,
+    probes_left: &mut usize,
+) -> String {
+    let parsed: JsonValue = match serde_json::from_str(arguments) {
+        Ok(parsed) => parsed,
+        Err(error) => return format!("Az eszköz paraméterei nem értelmezhetők: {error}"),
+    };
+
+    match name {
+        "search_schema" => {
+            let terms = parsed["terms"].as_str().unwrap_or_default();
+            search_schema_tool(catalog, terms)
+        }
+        "describe_table" => {
+            let table = parsed["table"].as_str().unwrap_or_default();
+            describe_table_tool(catalog, table)
+        }
+        "resolve_entity" => {
+            let entity_name = parsed["name"].as_str().unwrap_or_default();
+            let role = parsed["role"].as_str().unwrap_or_default();
+            let resolved = if role == "billed_customer" {
+                resolve_billed_customer(settings, password.to_string(), entity_name).await
+            } else {
+                resolve_end_customer(settings, password.to_string(), entity_name).await
+            };
+            match resolved {
+                Err(error) => format!("A feloldás nem sikerült: {error}"),
+                Ok(matches) if matches.is_empty() => {
+                    format!("Nincs találat erre a névre: {entity_name}")
+                }
+                Ok(matches) => matches
+                    .iter()
+                    .take(10)
+                    .map(|(code, label)| format!("{label} -> kód: {code}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            }
+        }
+        "probe_query" => {
+            if *probes_left == 0 {
+                return "Elérted a próbalekérdezések számának korlátját. Add meg a végleges tervet a már összegyűjtött információból.".into();
+            }
+            *probes_left -= 1;
+            let sql = parsed["sql"].as_str().unwrap_or_default();
+            // Szándékosan csak a read-only őr fut, nem az üzleti validátor:
+            // egy próbalekérdezés (például `SELECT DISTINCT posted FROM
+            // invoice`) jogosan nem felel meg az árbevétel-szabályoknak.
+            // A VÉGLEGES terv továbbra is átmegy a teljes ellenőrzésen.
+            match run_query_classified(settings, password.to_string(), sql, PROBE_QUERY_ROWS).await
+            {
+                Err(failure) => format!("A próbalekérdezés sikertelen: {}", failure.message()),
+                Ok((columns, rows, truncated)) => {
+                    let preview = serde_json::to_string(&rows).unwrap_or_default();
+                    format!(
+                        "Oszlopok: {}\nSorok: {}{}\n{}",
+                        columns.join(", "),
+                        rows.len(),
+                        if truncated { " (csonkolt)" } else { "" },
+                        preview
+                            .chars()
+                            .take(PROBE_RESULT_CHARACTERS)
+                            .collect::<String>()
+                    )
+                }
+            }
+        }
+        unknown => format!("Nincs ilyen eszköz: {unknown}"),
+    }
+}
+
+fn search_schema_tool(catalog: &SchemaCatalog, terms: &str) -> String {
+    let needles = normalize_for_search(terms)
+        .split_whitespace()
+        .filter(|term| term.len() >= 3)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if needles.is_empty() {
+        return "Adj meg legalább egy, három karakternél hosszabb keresőkifejezést.".into();
+    }
+
+    let mut hits = catalog
+        .tables
+        .iter()
+        .filter_map(|table| {
+            let table_name = table.name.to_lowercase();
+            let name_score = needles
+                .iter()
+                .filter(|needle| table_name.contains(needle.as_str()))
+                .count()
+                * 100;
+            let matching_columns = table
+                .columns
+                .iter()
+                .filter(|column| {
+                    let column_name = column.name.to_lowercase();
+                    needles
+                        .iter()
+                        .any(|needle| column_name.contains(needle.as_str()))
+                })
+                .collect::<Vec<_>>();
+            let score = name_score + matching_columns.len() * 10;
+            (score > 0).then_some((score, table, matching_columns))
+        })
+        .collect::<Vec<_>>();
+    hits.sort_by_key(|(score, table, _)| (Reverse(*score), table.name.clone()));
+    if hits.is_empty() {
+        return "Nincs találat. Próbálj más kifejezést, vagy kérd a describe_table eszközzel egy konkrét tábla leírását.".into();
+    }
+
+    hits.truncate(SEARCH_SCHEMA_MAX_TABLES);
+    hits.into_iter()
+        .map(|(_, table, matching_columns)| {
+            let columns = if matching_columns.is_empty() {
+                "a találat a táblanévre illeszkedik; a describe_table adja az oszlopokat"
+                    .to_string()
+            } else {
+                matching_columns
+                    .iter()
+                    .take(SEARCH_SCHEMA_MAX_COLUMNS)
+                    .map(|column| format!("{}:{}", column.name, column.column_type))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let (category, description) = table_business_metadata(&table.name);
+            format!(
+                "[{category}] {}{} — illeszkedő oszlopok: {columns}",
+                table.name,
+                description
+                    .map(|text| format!(" ({text})"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn describe_table_tool(catalog: &SchemaCatalog, table_name: &str) -> String {
+    let Some(table) = catalog
+        .tables
+        .iter()
+        .find(|table| table.name.eq_ignore_ascii_case(table_name))
+    else {
+        return format!("Nincs ilyen tábla: {table_name}. Keress rá a search_schema eszközzel.");
+    };
+
+    let (category, description) = table_business_metadata(&table.name);
+    let mut text = format!("[{category}] {}", table.name);
+    if let Some(description) = description {
+        text.push_str(&format!(" — {description}"));
+    }
+    if let Some(rows) = table.estimated_rows {
+        text.push_str(&format!(" (~{rows} sor)"));
+    }
+    text.push_str("\nOszlopok:\n");
+    for column in &table.columns {
+        let mut flags = Vec::new();
+        if column.key == "PRI" {
+            flags.push("PK".to_string());
+        } else if column.key == "UNI" {
+            flags.push("UNIQUE".to_string());
+        }
+        for relationship in table
+            .relationships
+            .iter()
+            .filter(|relationship| relationship.column == column.name)
+        {
+            flags.push(format!(
+                "FK->{}.{}",
+                relationship.referenced_table, relationship.referenced_column
+            ));
+        }
+        if column.nullable {
+            flags.push("NULL".to_string());
+        }
+        text.push_str(&format!("- {}:{}", column.name, column.column_type));
+        if !flags.is_empty() {
+            text.push_str(&format!(" [{}]", flags.join(",")));
+        }
+        if !column.samples.is_empty() {
+            text.push_str(&format!(" példaértékek: {}", column.samples.join(" | ")));
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// A nyers HTTP-réteg: a tool-ciklus és az egylövésű hívás is ezt használja.
+async fn post_ai_request(
+    api_key: &str,
+    endpoint: &str,
+    request: &JsonValue,
+) -> Result<JsonValue, String> {
+    let response = timeout(
+        AI_REQUEST_TIMEOUT,
+        http_client()
+            .post(endpoint)
+            .bearer_auth(api_key)
+            .json(request)
+            .send(),
+    )
+    .await
+    .map_err(|_| "Az AI-szolgáltatás időtúllépés miatt megszakadt.".to_string())?
+    .map_err(|error| format!("Az AI-szolgáltatás nem érhető el: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("Az AI-válasz nem olvasható: {error}"))?;
+    if !status.is_success() {
+        if let Ok(error_json) = serde_json::from_str::<JsonValue>(&body) {
+            if error_json["error"]["code"].as_str() == Some("credit_balance_exhausted") {
+                return Err(
+                    "Az OpenAI API-egyenlege elfogyott. Tölts fel kreditet az OpenAI Platform Billing oldalon, majd próbáld újra."
+                        .into(),
+                );
+            }
+        }
+        let concise = body.chars().take(500).collect::<String>();
+        return Err(format!(
+            "Az AI-szolgáltatás hibát jelzett ({status}): {concise}"
+        ));
+    }
+
+    serde_json::from_str(&body)
+        .map_err(|error| format!("Az AI-válasz formátuma érvénytelen: {error}"))
+}
+
+fn responses_usage(response_json: &JsonValue) -> TokenUsage {
+    TokenUsage {
+        input_tokens: response_json["usage"]["input_tokens"]
+            .as_u64()
+            .unwrap_or_default(),
+        output_tokens: response_json["usage"]["output_tokens"]
+            .as_u64()
+            .unwrap_or_default(),
+        cached_input_tokens: response_json["usage"]["input_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap_or_default(),
+        total_tokens: response_json["usage"]["total_tokens"]
+            .as_u64()
+            .unwrap_or_default(),
+    }
+}
+
 async fn call_ai(
     settings: &StoredSettings,
     api_key: &str,
     system: &str,
     user: &str,
-    json_mode: bool,
+    options: AiCallOptions,
 ) -> Result<AiCallResult, String> {
-    let uses_responses_api =
-        settings.ai_model.starts_with("gpt-5") || settings.ai_model.starts_with("gpt-6");
+    match call_ai_once(settings, api_key, system, user, options).await? {
+        AiCallOutcome::Complete(result) => Ok(result),
+        AiCallOutcome::OutOfOutputBudget => {
+            let retried = AiCallOptions {
+                max_output_tokens: options.max_output_tokens * MAX_OUTPUT_TOKEN_RETRY_FACTOR,
+                ..options
+            };
+            match call_ai_once(settings, api_key, system, user, retried).await? {
+                AiCallOutcome::Complete(result) => Ok(result),
+                AiCallOutcome::OutOfOutputBudget => Err(format!(
+                    "Az AI {} tokenes kimeneti korlátot is elérte a gondolkodással együtt, ezért nem adott teljes választ. Válassz kisebb reasoning igényű modellt, vagy szűkítsd a kérdést.",
+                    retried.max_output_tokens
+                )),
+            }
+        }
+    }
+}
+
+async fn call_ai_once(
+    settings: &StoredSettings,
+    api_key: &str,
+    system: &str,
+    user: &str,
+    options: AiCallOptions,
+) -> Result<AiCallOutcome, String> {
+    let AiCallOptions {
+        json_mode,
+        reasoning_effort,
+        max_output_tokens,
+    } = options;
+    let uses_responses_api = uses_responses_api(settings);
     let endpoint = if uses_responses_api {
         format!("{}/responses", settings.ai_base_url.trim_end_matches('/'))
     } else {
@@ -2523,14 +3627,15 @@ async fn call_ai(
             settings.ai_base_url.trim_end_matches('/')
         )
     };
-    let max_completion_tokens = if json_mode { 1_600 } else { 1_200 };
+    let reasoning_effort =
+        supports_reasoning_effort(&settings.ai_model).then_some(reasoning_effort);
     let responses_input = responses_input(user, json_mode);
     let mut request = if uses_responses_api {
         json!({
             "model": settings.ai_model,
             "instructions": system,
             "input": responses_input,
-            "max_output_tokens": max_completion_tokens,
+            "max_output_tokens": max_output_tokens,
             "store": false
         })
     } else {
@@ -2540,9 +3645,16 @@ async fn call_ai(
                 { "role": "system", "content": system },
                 { "role": "user", "content": user }
             ],
-            "max_completion_tokens": max_completion_tokens
+            "max_completion_tokens": max_output_tokens
         })
     };
+    if let Some(effort) = reasoning_effort {
+        if uses_responses_api {
+            request["reasoning"] = json!({ "effort": effort });
+        } else {
+            request["reasoning_effort"] = json!(effort);
+        }
+    }
     if json_mode && uses_responses_api {
         request["text"] = json!({
             "format": {
@@ -2569,40 +3681,32 @@ async fn call_ai(
         request["response_format"] = json!({ "type": "json_object" });
     }
 
-    let response = timeout(
-        Duration::from_secs(55),
-        Client::new()
-            .post(endpoint)
-            .bearer_auth(api_key)
-            .json(&request)
-            .send(),
-    )
-    .await
-    .map_err(|_| "Az AI-szolgáltatás időtúllépés miatt megszakadt.".to_string())?
-    .map_err(|error| format!("Az AI-szolgáltatás nem érhető el: {error}"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| format!("Az AI-válasz nem olvasható: {error}"))?;
-    if !status.is_success() {
-        if let Ok(error_json) = serde_json::from_str::<JsonValue>(&body) {
-            if error_json["error"]["code"].as_str() == Some("credit_balance_exhausted") {
-                return Err(
-                    "Az OpenAI API-egyenlege elfogyott. Tölts fel kreditet az OpenAI Platform Billing oldalon, majd próbáld újra."
-                        .into(),
-                );
-            }
-        }
-        let concise = body.chars().take(500).collect::<String>();
-        return Err(format!(
-            "Az AI-szolgáltatás hibát jelzett ({status}): {concise}"
-        ));
-    }
-
-    let response_json: JsonValue = serde_json::from_str(&body)
-        .map_err(|error| format!("Az AI-válasz formátuma érvénytelen: {error}"))?;
+    let response_json = post_ai_request(api_key, &endpoint, &request).await?;
     let (content, usage) = if uses_responses_api {
+        // A reasoning modell a kimeneti budgetet a belső gondolkodásra is
+        // költi, ezért a csonka választ a szöveg kiolvasása előtt kell
+        // észrevenni: ilyenkor az `output` csak reasoning elemet tartalmaz.
+        match response_json["status"].as_str() {
+            Some("incomplete") => {
+                let reason = response_json["incomplete_details"]["reason"].as_str();
+                if reason == Some("max_output_tokens") {
+                    return Ok(AiCallOutcome::OutOfOutputBudget);
+                }
+                return Err(format!(
+                    "Az AI nem fejezte be a választ ({}).",
+                    reason.unwrap_or("ismeretlen ok")
+                ));
+            }
+            Some("failed") => {
+                return Err(format!(
+                    "Az AI-hívás sikertelen: {}",
+                    response_json["error"]["message"]
+                        .as_str()
+                        .unwrap_or("ismeretlen hiba")
+                ));
+            }
+            _ => {}
+        }
         let content = response_json["output"]
             .as_array()
             .into_iter()
@@ -2615,22 +3719,11 @@ async fn call_ai(
                     .flatten()
             })
             .ok_or_else(|| "Az AI-válasz nem tartalmazott szöveget.".to_string())?;
-        let usage = TokenUsage {
-            input_tokens: response_json["usage"]["input_tokens"]
-                .as_u64()
-                .unwrap_or_default(),
-            output_tokens: response_json["usage"]["output_tokens"]
-                .as_u64()
-                .unwrap_or_default(),
-            cached_input_tokens: response_json["usage"]["input_tokens_details"]["cached_tokens"]
-                .as_u64()
-                .unwrap_or_default(),
-            total_tokens: response_json["usage"]["total_tokens"]
-                .as_u64()
-                .unwrap_or_default(),
-        };
-        (content, usage)
+        (content, responses_usage(&response_json))
     } else {
+        if response_json["choices"][0]["finish_reason"].as_str() == Some("length") {
+            return Ok(AiCallOutcome::OutOfOutputBudget);
+        }
         let content = response_json["choices"][0]["message"]["content"]
             .as_str()
             .map(str::to_owned)
@@ -2651,17 +3744,27 @@ async fn call_ai(
         };
         (content, usage)
     };
-    Ok(AiCallResult { content, usage })
+    Ok(AiCallOutcome::Complete(AiCallResult { content, usage }))
 }
 
 async fn summarize_query_result(
     settings: &StoredSettings,
     api_key: &str,
-    question: &str,
-    rows: &[JsonValue],
-    truncated: bool,
-    analysis_fy_window: u8,
+    context: SummaryContext<'_>,
 ) -> Result<AiCallResult, String> {
+    let SummaryContext {
+        question,
+        title,
+        sql,
+        columns,
+        rows,
+        truncated,
+        analysis_fy_window,
+        fy_window_start,
+        period_note,
+        entity_note,
+        history,
+    } = context;
     let preview_rows = rows.iter().take(SUMMARY_PREVIEW_ROWS).collect::<Vec<_>>();
     let full_preview = serde_json::to_string(&preview_rows)
         .map_err(|error| format!("Az eredmény nem alakítható át: {error}"))?;
@@ -2673,16 +3776,56 @@ async fn summarize_query_result(
 Válaszolj a felhasználó kérdésének nyelvén: magyar kérdésre magyarul, angol kérdésre angolul. Kezdd a legfontosabb üzleti következtetéssel, majd támaszd alá a kapott számokkal.
 Ne találj ki adatot, pénznemet, mértékegységet vagy üzleti definíciót. Ha az eredmény üres vagy kétértelmű, ezt mondd ki.
 Minden pénzösszeget magyar formátumban, hármas számjegycsoportokkal és legfeljebb két tizedessel írj, például: 24 752 384,12.
-Legyél tömör és gyakorlatias, legfeljebb 180 szóban. Jelezd, ha a látható eredmény korlátozott. Markdown használható."#;
-    let summary_user = format!(
-        "Eredeti kérdés: {question}\nBeállított elemzési időablak: {analysis_fy_window} FY.\n\nLekérdezési eredmény első {} sora (JSON, legfeljebb {} karakter):\n{}\n\nTeljes visszaadott sorszám: {}\nAdatbázis-lekérdezés csonkolt: {}",
+
+Összegeket, átlagokat és szélsőértékeket KIZÁRÓLAG a megadott "Összesítés" blokkból vegyél: azt a teljes eredményhalmazon számoltuk ki. A soronkénti előnézet csak illusztráció, abból soha ne összegezz.
+Nézd meg a lefuttatott SQL-t, és ha az nem a kérdést válaszolja meg — más időszakot, más szerepet vagy más mutatót szűr —, ezt mondd ki a válasz elején, ne értelmezd bele a kért jelentést.
+Ha az eredmény üres, ne elégedj meg annyival, hogy "nincs adat": írd le az SQL alapján, pontosan mire szűrtünk, és mi a legvalószínűbb oka (időszak, cégszám, szerep vagy entitáskód).
+
+A terjedelmet a kérdés szabja meg: ténykérdésre 2-4 mondat, elemző vagy összehasonlító kérdésre legfeljebb 400 szó. Ne told fel a választ üres általánossággal. Jelezd, ha a látható eredmény korlátozott. Markdown használható."#;
+    let history_text = recent_history_text(history, 3, 1_200);
+    let mut summary_user = format!(
+        r#"Eredeti kérdés: {question}
+
+Lefuttatott lekérdezés címe: {title}
+Lefuttatott SQL:
+{sql}
+
+Eredmény oszlopai: {}
+Beállított elemzési időablak: {analysis_fy_window} FY, kezdete {fy_window_start}.
+{period_note}
+Adatbázis-lekérdezés csonkolt (a sorlimit miatt): {truncated}
+
+Összesítés (determinisztikusan, a teljes visszaadott eredményen számolva — ezeket a számokat használd):
+{}
+
+Soronkénti előnézet, az első {} sor (JSON, legfeljebb {} karakter), csak illusztrációként:
+{}"#,
+        if columns.is_empty() {
+            "(nincs)".to_string()
+        } else {
+            columns.join(", ")
+        },
+        result_statistics(columns, rows),
         SUMMARY_PREVIEW_ROWS,
         SUMMARY_PREVIEW_CHARACTERS,
         result_preview,
-        rows.len(),
-        truncated
     );
-    call_ai(settings, api_key, summary_system, &summary_user, false).await
+    if let Some(entity_note) = entity_note {
+        summary_user.push_str(&format!("\n\nFeloldott entitás: {entity_note}"));
+    }
+    if !history_text.is_empty() {
+        summary_user.push_str(&format!(
+            "\n\nKorábbi beszélgetés (a követő kérdések értelmezéséhez):\n{history_text}"
+        ));
+    }
+    call_ai(
+        settings,
+        api_key,
+        summary_system,
+        &summary_user,
+        AiCallOptions::summary(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2707,13 +3850,23 @@ async fn analyze_quick_erp(
     let api_key = read_secret(&app, "AI_API_KEY", AI_API_KEY_ACCOUNT, "AI API-kulcs")?;
     let (columns, rows, truncated) =
         run_query(&settings, mysql_password, &sql, plan.max_rows).await?;
+    let scope = PeriodScope::resolve(question.trim(), analysis_fy_window);
     let summary_call = summarize_query_result(
         &settings,
         &api_key,
-        question.trim(),
-        &rows,
-        truncated,
-        analysis_fy_window,
+        SummaryContext {
+            question: question.trim(),
+            title: &plan.title,
+            sql: &sql,
+            columns: &columns,
+            rows: &rows,
+            truncated,
+            analysis_fy_window,
+            fy_window_start: format!("{}-01-01", scope.window_start_year),
+            period_note: scope.summary_note(analysis_fy_window),
+            entity_note: None,
+            history: &[],
+        },
     )
     .await?;
     let row_count = rows.len();
@@ -2775,6 +3928,7 @@ async fn analyze_erp(
     let analysis_fy_window = validate_analysis_fy_window(settings.analysis_fy_window)?;
     let purchase_fy_window = purchase_fy_window(question.trim(), analysis_fy_window);
     let billed_customer_name = explicit_billed_customer_name(question.trim());
+    let mut entity_note: Option<String> = None;
     let mut relationship_plan = if let Some(search_name) = billed_customer_name {
         let matches =
             resolve_billed_customer(&settings, mysql_password.clone(), &search_name).await?;
@@ -2809,6 +3963,10 @@ async fn analyze_erp(
             .into_iter()
             .map(|(code, _)| code)
             .collect::<Vec<_>>();
+        entity_note = Some(format!(
+            "számlázott vevő „{label}”, ügyfélkódok: {}",
+            codes.join(", ")
+        ));
         Some(billed_customer_purchase_plan(
             &label,
             &codes,
@@ -2860,6 +4018,10 @@ async fn analyze_erp(
                 .into_iter()
                 .map(|(code, _)| code)
                 .collect::<Vec<_>>();
+            entity_note = Some(format!(
+                "végfelhasználó „{label}”, entitáskódok: {}",
+                codes.join(", ")
+            ));
             let mut plan = end_customer_purchase_plan(&label, &codes, purchase_fy_window);
             if is_english_question(question.trim()) {
                 plan.title = format!(
@@ -2876,13 +4038,23 @@ async fn analyze_erp(
         let sql = validate_planned_sql(question.trim(), &plan.sql)?;
         let (columns, rows, truncated) =
             run_query(&settings, mysql_password, &sql, plan.max_rows).await?;
+        let scope = PeriodScope::resolve(question.trim(), purchase_fy_window);
         let summary_call = summarize_query_result(
             &settings,
             &api_key,
-            question.trim(),
-            &rows,
-            truncated,
-            purchase_fy_window,
+            SummaryContext {
+                question: question.trim(),
+                title: &plan.title,
+                sql: &sql,
+                columns: &columns,
+                rows: &rows,
+                truncated,
+                analysis_fy_window: purchase_fy_window,
+                fy_window_start: format!("{}-01-01", scope.window_start_year),
+                period_note: scope.summary_note(purchase_fy_window),
+                entity_note: entity_note.clone(),
+                history: &history,
+            },
         )
         .await?;
         let row_count = rows.len();
@@ -2912,74 +4084,90 @@ async fn analyze_erp(
     let catalog = load_schema_catalog(&app, &settings, mysql_password.clone()).await?;
     let (schema_context, schema_selection) =
         select_schema_context(&catalog, question.trim(), &history);
-    let mut relevant_history = history
-        .iter()
-        .filter(|message| message.role == "user" || message.role == "assistant")
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>();
-    relevant_history.reverse();
-    let history_text = relevant_history
-        .into_iter()
-        .map(|message| {
-            let compact_content = message.content.chars().take(3_500).collect::<String>();
-            format!("{}: {compact_content}", message.role)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let history_text = recent_history_text(&history, 4, 3_500);
 
     let fiscal_year_start = format!(
         "MAKEDATE(YEAR(CURRENT_DATE) - {}, 1)",
         analysis_fy_window - 1
     );
+    let period_scope = PeriodScope::resolve(question.trim(), analysis_fy_window);
     let relationship_skill = business_relationship_skill(question.trim());
-    let knowledge_context = knowledge_prompt_context();
+    // A prompt-cache csak a szó szerint egyező előtagra illeszkedik, ezért a
+    // kérdésfüggő rész (időszak, reláció-skill, séma) a változatlan blokk
+    // UTÁN következik, nem a közepébe tűzve.
     let planner_system = format!(
-        r#"Te az ERGO, a Trans-Europe óvatos ERP-adatelemzője vagy.
-Magyarul és angolul is értelmezd a kérdéseket. A title mezőt a kérdés nyelvén add meg.
-Készíts pontos MySQL lekérdezési tervet a megadott adatbázis-séma alapján.
-Kizárólag egy SELECT vagy WITH lekérdezést adhatsz. Tilos minden adatmódosítás, DDL, zárolás, fájlművelet, komment, rendszer-séma és több utasítás.
-Az sql mező pontosan egyetlen SELECT vagy WITH utasítást tartalmazzon, záró pontosvessző nélkül. Ne használj SET, DECLARE, ideiglenes táblát vagy tárolt eljárást.
-Ne találj ki táblát vagy oszlopot. Használj explicit oszlopokat és aggregálj SQL-ben. A sorok száma legfeljebb 200 legyen.
-Az üzleti kategóriát és a táblaleírást tekintsd mérvadónak; az azonos szavakat tartalmazó, de más üzleti célú táblákat ne keverd össze.
-Kötelező árbevétel-definíció számlaadatok használatakor:
-- az árbevétel nettó számlázott árbevételt jelent a Trans Europe Zrt. vállalati alapdevizájában;
-- a Trans Europe Zrt. rekordjait companynumber = '1' azonosítja;
-- csak a posted = 1 könyvelt számlákat használd;
-- számlafejes összesítéshez invoice.itemsumbase mezőt használj, és a debitcredit = 1 jóváírásokat vond le;
-- cikkszintű elemzéshez invoiceline.linepricebase mezőt használj, az invoice táblához companynumber és invoicenumber alapján kapcsolva, hogy a könyveltséget és a jóváírás előjelét alkalmazhasd;
-- a vatbase áfaösszeg, soha ne nevezd vagy összegezd árbevételként;
-- eltérő invoice.currency értékeket ne add össze dokumentumdevizában; összehasonlításhoz a *base mezőket használd.
-Időfüggő üzleti adatoknál kötelező közvetlenül az SQL WHERE feltételében időszakot szűrni:
-- ha a kérdés napot vagy időszakot ad meg (például ma, tegnap, adott hónap), pontosan arra, és ne olvass be azon kívüli rekordot;
-- a beállított elemzési időablak {analysis_fy_window} FY; ennek kezdete {fiscal_year_start};
-- külön időszak hiányában ettől a kezdettől szűrj;
-- a beállított {analysis_fy_window} FY időablaknál régebbi tranzakciót akkor se használj, ha a felhasználó tágabb időszakot kér;
-- dátumként tárolt varchar mezőnél vedd figyelembe a sémában jelzett típust és a ponttal tagolt YYYY.MM.DD formátumot;
-- fejlécszámhoz ne kapcsolj tételtáblát, ha a kérdés nem kér tételszintű adatot.
-
-{relationship_skill}
-Vevői termékvásárlásnál ne keverd össze a számlázott vevőt/viszonteladót (invoice.customernumber -> customer.customernumber) a tényleges végfelhasználóval (endcustomernumber -> endcustomer.endcustomernumber). Ha a kérdés szerepe nem egyértelmű, ne válassz helyette: kérdezz vissza, hogy a számlázott viszonteladót/vevőt vagy a végfelhasználót keressük.
-Helyi, verziózott ERP-tudás:
-{knowledge_context}
-Kizárólag JSON objektummal válaszolj ebben az alakban:
-{{"sql":"...","title":"rövid magyar cím","visualization":"table|bar|line","maxRows":50}}
-
-{schema_context}"#
+        "{}\n\n--- A kérdéshez tartozó rész ---\nIdőszakszabály:\n{}\n\n{relationship_skill}\n\n{schema_context}",
+        planner_static_instructions(),
+        period_scope.planner_rule(analysis_fy_window, &fiscal_year_start),
     );
     let planner_user = format!(
         "Korábbi beszélgetés:\n{history_text}\n\nFelhasználói kérdés:\n{}",
         question.trim()
     );
-    let planner_call = call_ai(&settings, &api_key, &planner_system, &planner_user, true).await?;
-    let mut planner_usage = planner_call.usage;
-    let mut plan: QueryPlan = extract_json(&planner_call.content)?;
-    plan.sql = match validate_planned_sql(question.trim(), &plan.sql) {
-        Ok(sql) => sql,
-        Err(first_error) => {
-            let repair_user = format!(
-                r#"Az előző lekérdezési terv biztonsági vagy üzleti ellenőrzése sikertelen volt.
-Hiba: {first_error}
+    // A Responses API-t használó modellek eszközökkel tervezhetnek: maguk
+    // nézhetnek utána a sémának és a tényleges adatnak. A chat/completions
+    // modellek a korábbi egylövésű úton maradnak.
+    let (mut plan, mut planner_usage) = if uses_responses_api(&settings) {
+        plan_with_tools(
+            &settings,
+            &api_key,
+            &planner_system,
+            &planner_user,
+            &catalog,
+            &mysql_password,
+        )
+        .await?
+    } else {
+        let planner_call = call_ai(
+            &settings,
+            &api_key,
+            &planner_system,
+            &planner_user,
+            AiCallOptions::planner(),
+        )
+        .await?;
+        let plan: QueryPlan = extract_json(&planner_call.content)?;
+        (plan, planner_call.usage)
+    };
+
+    // Egyetlen javító ciklus a biztonsági/üzleti ellenőrzésre ÉS a MySQL
+    // futási hibájára. Korábban csak a validáció kapott második esélyt, egy
+    // elírt oszlopnév pedig azonnal a felhasználónál landolt.
+    let mut attempt = 1;
+    let (columns, rows, truncated) = loop {
+        plan.max_rows = plan.max_rows.clamp(1, MAX_RESULT_ROWS);
+        let attempt_outcome = match validate_planned_sql(question.trim(), &plan.sql) {
+            Err(validation_error) => Err(validation_error),
+            Ok(validated_sql) => {
+                plan.sql = validated_sql;
+                match run_query_classified(
+                    &settings,
+                    mysql_password.clone(),
+                    &plan.sql,
+                    plan.max_rows,
+                )
+                .await
+                {
+                    Ok(result) => Ok(result),
+                    // A kapcsolati és időkorlát-hibát nem a terv okozta,
+                    // ezért nincs értelme újratervezni.
+                    Err(QueryFailure::Infrastructure(message)) => return Err(message),
+                    Err(QueryFailure::Sql(message)) => Err(message),
+                }
+            }
+        };
+
+        match attempt_outcome {
+            Ok(result) => break result,
+            Err(error) => {
+                if attempt >= MAX_PLAN_ATTEMPTS {
+                    return Err(format!(
+                        "Az AI {attempt} próbálkozás után sem adott futtatható, biztonságos és üzletileg érvényes SELECT lekérdezést: {error}"
+                    ));
+                }
+                let repair_user = format!(
+                    r#"Az előző lekérdezési terv nem futott le, vagy nem ment át a biztonsági és üzleti ellenőrzésen.
+Hiba: {error}
 
 Hibás SQL:
 {}
@@ -2987,36 +4175,43 @@ Hibás SQL:
 Eredeti felhasználói kérdés:
 {}
 
-Javítsd ki a tervet. A JSON sql mezője pontosan egyetlen, záró pontosvessző nélküli SELECT vagy WITH utasítás legyen. Ne használj SET, DECLARE, ideiglenes táblát, tárolt eljárást, kommentet vagy több utasítást. Kizárólag a kért JSON objektummal válaszolj."#,
-                plan.sql,
-                question.trim()
-            );
-            let repaired_call =
-                call_ai(&settings, &api_key, &planner_system, &repair_user, true).await?;
-            planner_usage.add(&repaired_call.usage);
-            let repaired_plan: QueryPlan = extract_json(&repaired_call.content)?;
-            plan = repaired_plan;
-            validate_planned_sql(question.trim(), &plan.sql).map_err(|second_error| {
-                format!(
-                    "Az AI két próbálkozás után sem adott biztonságos és üzletileg érvényes SELECT lekérdezést: {second_error}"
+Javítsd ki a tervet. Ha a hiba ismeretlen táblára vagy oszlopra utal, kizárólag a fenti sémarészletben szereplő neveket használd. A JSON sql mezője pontosan egyetlen, záró pontosvessző nélküli SELECT vagy WITH utasítás legyen. Ne használj SET, DECLARE, ideiglenes táblát, tárolt eljárást, kommentet vagy több utasítást. Kizárólag a kért JSON objektummal válaszolj."#,
+                    plan.sql,
+                    question.trim()
+                );
+                let repaired_call = call_ai(
+                    &settings,
+                    &api_key,
+                    &planner_system,
+                    &repair_user,
+                    AiCallOptions::repair(),
                 )
-            })?
+                .await?;
+                planner_usage.add(&repaired_call.usage);
+                plan = extract_json(&repaired_call.content)?;
+                attempt += 1;
+            }
         }
     };
-    plan.max_rows = plan.max_rows.clamp(1, MAX_RESULT_ROWS);
     if !matches!(plan.visualization.as_str(), "table" | "bar" | "line") {
         plan.visualization = "table".into();
     }
-
-    let (columns, rows, truncated) =
-        run_query(&settings, mysql_password, &plan.sql, plan.max_rows).await?;
     let summary_call = summarize_query_result(
         &settings,
         &api_key,
-        question.trim(),
-        &rows,
-        truncated,
-        analysis_fy_window,
+        SummaryContext {
+            question: question.trim(),
+            title: &plan.title,
+            sql: &plan.sql,
+            columns: &columns,
+            rows: &rows,
+            truncated,
+            analysis_fy_window,
+            fy_window_start: format!("{}-01-01", period_scope.window_start_year),
+            period_note: period_scope.summary_note(analysis_fy_window),
+            entity_note: None,
+            history: &history,
+        },
     )
     .await?;
     let mut token_usage = planner_usage;
@@ -3069,17 +4264,18 @@ pub fn run() {
 mod tests {
     use super::{
         ambiguous_purchase_company_name, assert_read_only_sql, billed_customer_purchase_plan,
-        business_relationship_skill, capability_answer, clarified_purchase_question,
-        contains_token_phrase, end_customer_purchase_plan, explicit_billed_customer_name,
-        explicit_end_customer_name, extract_json, fixed_quick_plan, fixed_relationship_plan,
-        is_chat_model, is_customer_purchase_question, is_english_question, knowledge_pack,
-        knowledge_prompt_context, normalize_for_search, percent_encode_mailto, purchase_fy_window,
-        purchase_role_clarification, requested_top_end_customer_limit, requests_chart,
-        resolve_end_customer, responses_input, run_query, schema_search_terms,
-        select_schema_context, table_business_metadata, top_end_customers_plan,
-        validate_analysis_fy_window, validate_feedback, validate_model, validate_planned_sql,
-        AnalysisFeedbackInput, CatalogColumn, HistoryMessage, JsonValue, QueryPlan, SchemaCatalog,
-        SchemaTable, StoredSettings,
+        business_relationship_skill, capability_answer, civil_date_from_unix,
+        clarified_purchase_question, contains_token_phrase, describe_table_tool,
+        end_customer_purchase_plan, explicit_billed_customer_name, explicit_end_customer_name,
+        extract_json, fixed_quick_plan, fixed_relationship_plan, fy_window_years, is_chat_model,
+        is_customer_purchase_question, is_english_question, is_sampleable_column, knowledge_pack,
+        knowledge_prompt_context, normalize_for_search, percent_encode_mailto, planner_tools,
+        purchase_fy_window, purchase_role_clarification, requested_top_end_customer_limit,
+        requests_chart, resolve_end_customer, responses_input, result_statistics, run_query,
+        schema_search_terms, search_schema_tool, select_schema_context, table_business_metadata,
+        top_end_customers_plan, validate_analysis_fy_window, validate_feedback, validate_model,
+        validate_planned_sql, AnalysisFeedbackInput, CatalogColumn, HistoryMessage, JsonValue,
+        PeriodScope, QueryPlan, SchemaCatalog, SchemaTable, StoredSettings,
     };
 
     #[test]
@@ -3812,18 +5008,21 @@ mod tests {
                             column_type: "varchar(255)".into(),
                             nullable: false,
                             key: "MUL".into(),
+                            samples: Vec::new(),
                         },
                         CatalogColumn {
                             name: "duedate".into(),
                             column_type: "varchar(12)".into(),
                             nullable: false,
                             key: String::new(),
+                            samples: vec!["2024.01.31".into(), "2024.02.29".into()],
                         },
                         CatalogColumn {
                             name: "remainderbase".into(),
                             column_type: "decimal(20,2)".into(),
                             nullable: false,
                             key: String::new(),
+                            samples: Vec::new(),
                         },
                     ],
                     relationships: vec![],
@@ -3837,15 +5036,183 @@ mod tests {
                         column_type: "varchar(255)".into(),
                         nullable: false,
                         key: "PRI".into(),
+                        samples: Vec::new(),
                     }],
                     relationships: vec![],
                 },
             ],
         };
         let (context, stats) = select_schema_context(&catalog, "Mennyi a lejárt kintlévőség?", &[]);
-        assert!(context.contains("customerentry"));
-        assert!(!context.contains("employee"));
+        let (inventory, detail) = context
+            .split_once("Részletes sémarészlet:")
+            .expect("a sémakontextus tartalmazza a részletes szakaszt");
+        assert!(detail.contains("customerentry"));
+        // A részletes szakasz továbbra sem éget tokent irreleváns táblára...
+        assert!(!detail.contains("employeenumber"));
+        // ...de a puszta táblanévlistában szerepel, hogy a modell tudja,
+        // mi létezik, és ne találjon ki táblanevet.
+        assert!(inventory.contains("employee"));
         assert_eq!(stats.selected_tables, 1);
         assert_eq!(stats.total_columns, 4);
+    }
+
+    #[test]
+    fn schema_context_shows_sampled_column_values() {
+        let catalog = SchemaCatalog {
+            database: "test".into(),
+            source: "localhost/test".into(),
+            generated_at: 0,
+            tables: vec![SchemaTable {
+                name: "invoice".into(),
+                table_type: "BASE TABLE".into(),
+                estimated_rows: Some(1_000),
+                columns: vec![CatalogColumn {
+                    name: "debitcredit".into(),
+                    column_type: "tinyint(1)".into(),
+                    nullable: false,
+                    key: String::new(),
+                    samples: vec!["0".into(), "1".into()],
+                }],
+                relationships: vec![],
+            }],
+        };
+        let (context, _) = select_schema_context(&catalog, "Mennyi az árbevétel?", &[]);
+        assert!(context.contains("debitcredit:tinyint(1) példaértékek: 0 | 1"));
+    }
+
+    #[test]
+    fn statistics_are_computed_over_every_returned_row() {
+        let columns = vec!["partner".to_string(), "netto".to_string()];
+        let rows = (1..=50)
+            .map(|index| super::json!({ "partner": format!("P{index}"), "netto": "100.50" }))
+            .collect::<Vec<_>>();
+        let statistics = result_statistics(&columns, &rows);
+        assert!(statistics.contains("Sorok száma: 50"));
+        // A DECIMAL szövegként jön vissza, mégis összegezhető kell legyen,
+        // és az összeg a teljes 50 sorra szóljon, nem a 40 soros előnézetre.
+        assert!(statistics.contains("összeg 5025"), "{statistics}");
+        assert!(statistics.contains("50 különböző"), "{statistics}");
+    }
+
+    #[test]
+    fn explicitly_requested_years_override_the_analysis_window() {
+        let (window_start, _) = fy_window_years(3);
+        let older_year = window_start - 2;
+        let scope = PeriodScope::resolve(&format!("Mennyi volt a {older_year} évi árbevétel?"), 3);
+        assert_eq!(scope.outside_years, vec![older_year]);
+        let rule = scope.planner_rule(3, "MAKEDATE(YEAR(CURRENT_DATE) - 2, 1)");
+        assert!(rule.contains("FELÜLÍRJA"), "{rule}");
+        // A négyjegyű szám nem biztosan évszám, ezért a döntést a modellre
+        // hagyjuk, nem adunk rá feltétlen utasítást.
+        assert!(rule.contains("ha a szám nem időszak"), "{rule}");
+        assert!(scope.summary_note(3).contains("az időablak nem szűkítette"));
+
+        let inside = PeriodScope::resolve("Mennyi volt az árbevétel?", 3);
+        assert!(inside.outside_years.is_empty());
+        assert!(inside.planner_rule(3, "x").contains("ne használj"));
+    }
+
+    #[test]
+    fn planner_tools_let_the_model_explore_and_finish() {
+        let tools = planner_tools();
+        let names = tools
+            .as_array()
+            .expect("az eszközlista tömb")
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        for expected in [
+            "search_schema",
+            "describe_table",
+            "resolve_entity",
+            "probe_query",
+            "submit_plan",
+        ] {
+            assert!(names.contains(&expected.to_string()), "{names:?}");
+        }
+        // A végleges terv ugyanazokat a mezőket adja, mint az egylövésű út,
+        // így a validáló és futtató réteg változatlanul használható.
+        let submit = tools
+            .as_array()
+            .expect("az eszközlista tömb")
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some("submit_plan"))
+            .expect("submit_plan eszköz");
+        let required = submit["parameters"]["required"]
+            .as_array()
+            .expect("kötelező mezők");
+        assert_eq!(required.len(), 4);
+    }
+
+    #[test]
+    fn schema_search_tool_finds_tables_and_reports_misses() {
+        let catalog = SchemaCatalog {
+            database: "test".into(),
+            source: "localhost/test".into(),
+            generated_at: 0,
+            tables: vec![SchemaTable {
+                name: "invoiceline".into(),
+                table_type: "BASE TABLE".into(),
+                estimated_rows: Some(10),
+                columns: vec![CatalogColumn {
+                    name: "linepricebase".into(),
+                    column_type: "decimal(20,2)".into(),
+                    nullable: false,
+                    key: String::new(),
+                    samples: Vec::new(),
+                }],
+                relationships: vec![],
+            }],
+        };
+        let found = search_schema_tool(&catalog, "invoiceline linepricebase");
+        assert!(found.contains("invoiceline"), "{found}");
+        assert!(found.contains("linepricebase"), "{found}");
+
+        // A téves találat helyett érthető üzenet megy vissza a modellhez,
+        // hogy tudjon másik kifejezéssel próbálkozni.
+        let missing = search_schema_tool(&catalog, "raktarkeszlet");
+        assert!(missing.contains("Nincs találat"), "{missing}");
+
+        let described = describe_table_tool(&catalog, "INVOICELINE");
+        assert!(
+            described.contains("linepricebase:decimal(20,2)"),
+            "{described}"
+        );
+        assert!(describe_table_tool(&catalog, "nincsilyen").contains("Nincs ilyen tábla"));
+    }
+
+    #[test]
+    fn computes_calendar_dates_without_a_date_library() {
+        assert_eq!(civil_date_from_unix(0), (1970, 1, 1));
+        assert_eq!(civil_date_from_unix(951_782_400), (2000, 2, 29));
+        assert_eq!(civil_date_from_unix(1_760_832_000), (2025, 10, 19));
+    }
+
+    #[test]
+    fn samples_only_low_cardinality_code_and_date_columns() {
+        let sampleable = CatalogColumn {
+            name: "debitcredit".into(),
+            column_type: "tinyint(1)".into(),
+            nullable: false,
+            key: String::new(),
+            samples: Vec::new(),
+        };
+        let free_text = CatalogColumn {
+            name: "itemtext1".into(),
+            column_type: "varchar(255)".into(),
+            nullable: false,
+            key: String::new(),
+            samples: Vec::new(),
+        };
+        let large = CatalogColumn {
+            name: "statustext".into(),
+            column_type: "text".into(),
+            nullable: true,
+            key: String::new(),
+            samples: Vec::new(),
+        };
+        assert!(is_sampleable_column(&sampleable));
+        assert!(!is_sampleable_column(&free_text));
+        assert!(!is_sampleable_column(&large));
     }
 }
