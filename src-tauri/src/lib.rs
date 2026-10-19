@@ -35,6 +35,19 @@ const SCHEMA_CORE_TABLES: &[&str] = &[
     "customerentry",
 ];
 const SCHEMA_CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const HUNGARIAN_STOP_WORDS: [&str; 19] = [
+    "adat", "adatok", "alapjan", "az", "egy", "es", "hogy", "kerlek", "legyen", "meg", "mely",
+    "melyik", "mi", "mind", "mutasd", "osszes", "szerint", "van", "volt",
+];
+/// A tanult memória retrieval korlátai.
+const MAX_MEMORY_EXAMPLES: usize = 4;
+const MAX_MEMORY_PITFALLS: usize = 4;
+const MEMORY_MIN_SIMILARITY: f64 = 0.18;
+const MEMORY_EXAMPLE_SQL_CHARACTERS: usize = 1_400;
+const MEMORY_CORRECTION_CHARACTERS: usize = 600;
+/// A magyar ragozás miatt a tokeneket előtagra vágjuk: az "arbevetel" és az
+/// "arbevetelt" így ugyanarra a kulcsra esik.
+const MEMORY_TERM_PREFIX: usize = 6;
 const MAX_SAMPLED_COLUMNS: usize = 80;
 const MAX_SAMPLES_PER_COLUMN: usize = 10;
 const MAX_SAMPLE_CHARACTERS: usize = 40;
@@ -397,6 +410,43 @@ fn fixed_quick_plan(quick_analysis: &str, analysis_fy_window: u8) -> Result<Quer
         }),
         _ => Err("Ismeretlen gyors elemzés.".into()),
     }
+}
+
+/// A bejövő számlák könyvelt felosztása csak költségjelölt: a teljes
+/// működési költséghez bér, értékcsökkenés és további főkönyvi tételek is
+/// szükségesek. Ezt a gyakori kérdést nem bízzuk nyolckörös AI-sémafeltárásra.
+fn incoming_operating_cost_plan(question: &str, analysis_fy_window: u8) -> Option<QueryPlan> {
+    let normalized = normalize_for_search(question);
+    let incoming_invoice = (normalized.contains("beerkezo")
+        || normalized.contains("bejovo")
+        || normalized.contains("szallitoi")
+        || normalized.contains("incoming")
+        || normalized.contains("supplier"))
+        && (normalized.contains("szamla") || normalized.contains("invoice"));
+    let operating_cost = (normalized.contains("mukodesi") || normalized.contains("operating"))
+        && (normalized.contains("koltseg")
+            || normalized.contains("cost")
+            || normalized.contains("expense"));
+    // Kifejezetten megadott évhez más dátumszűrés kell; azt nem helyettesítjük
+    // csendben a beállított FY-ablakkal.
+    let explicit_year = Regex::new(r"\b20\d{2}\b")
+        .expect("valid explicit year regex")
+        .is_match(&normalized);
+    if !incoming_invoice || !operating_cost || explicit_year {
+        return None;
+    }
+    let fiscal_year_start = format!(
+        "MAKEDATE(YEAR(CURRENT_DATE) - {}, 1)",
+        analysis_fy_window.saturating_sub(1)
+    );
+    Some(QueryPlan {
+        sql: format!(
+            "SELECT LEFT(l.invoicedate, 7) AS honap, COUNT(*) AS konyvelt_felosztasi_sorok, ROUND(SUM(COALESCE(l.amountbase, 0)), 2) AS netto_bejovo_szamla_felosztas_alapdevizaban, ROUND(SUM(CASE WHEN l.accountnumber LIKE '5%' THEN COALESCE(l.amountbase, 0) ELSE 0 END), 2) AS otos_koltsegnemre_konyvelt_resz, ROUND(SUM(CASE WHEN l.accountnumber LIKE '8%' THEN COALESCE(l.amountbase, 0) ELSE 0 END), 2) AS nyolcas_raforditasra_konyvelt_resz, ROUND(SUM(CASE WHEN l.accountnumber IS NULL OR (l.accountnumber NOT LIKE '5%' AND l.accountnumber NOT LIKE '8%') THEN COALESCE(l.amountbase, 0) ELSE 0 END), 2) AS egyeb_szamlakra_konyvelt_resz FROM invoiceallocationline l WHERE l.companynumber = '1' AND l.posted = 1 AND l.invoicedate >= DATE_FORMAT({fiscal_year_start}, '%Y.%m.%d') AND l.invoicedate <= DATE_FORMAT(CURRENT_DATE, '%Y.%m.%d') GROUP BY LEFT(l.invoicedate, 7) ORDER BY honap ASC LIMIT 60"
+        ),
+        title: format!("Bejövő számlák könyvelt nettó felosztása — {analysis_fy_window} FY"),
+        visualization: "table".into(),
+        max_rows: 60,
+    })
 }
 
 fn requested_top_end_customer_limit(question: &str) -> Option<usize> {
@@ -798,6 +848,382 @@ fn write_feedback_records(
         .map_err(|error| format!("A visszajelzés nem menthető: {error}"))?;
     fs::rename(&temporary, &path)
         .map_err(|error| format!("A visszajelzési tár nem véglegesíthető: {error}"))
+}
+
+/// Megtanult entitásalias (3. réteg): cégnév -> ellenőrzött ERP-kódok.
+///
+/// Ez a réteg KÖZVETLENÜL befolyásolja a pénzügyi számokat, mert azt dönti
+/// el, melyik cég adatait összegezzük. Ezért emberi jóváhagyás nélkül soha
+/// nem lép életbe: a bejegyzés `pending` állapotban keletkezik, és csak
+/// `approved` állapotban használja a feloldás. A modell nem írhatja.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LearnedAlias {
+    id: String,
+    created_at: u64,
+    /// A kérdésben szereplő név, ahogy a felhasználó írta.
+    search_name: String,
+    /// "end_customer" vagy "billed_customer" — a két szerep két külön törzs.
+    role: String,
+    /// A jóváhagyott kódok. `pending` állapotban üres.
+    codes: Vec<String>,
+    label: String,
+    /// Az összes jelölt, amiből a felhasználó választhat. A jóváhagyás csak
+    /// ezekből engedi a kódokat, hogy a UI ne tudjon idegen kódot bejuttatni.
+    candidates: Vec<LearnedAliasCandidate>,
+    status: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LearnedAliasCandidate {
+    code: String,
+    label: String,
+}
+
+static ALIAS_FILE_LOCK: Mutex<()> = Mutex::new(());
+
+fn learned_alias_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("learned-aliases.json"))
+        .map_err(|error| format!("A helyi aliastár útvonala nem érhető el: {error}"))
+}
+
+fn read_learned_aliases(app: &AppHandle) -> Result<Vec<LearnedAlias>, String> {
+    let path = learned_alias_path(app)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("A helyi aliastár nem olvasható: {error}"))?;
+    serde_json::from_str(&contents).map_err(|error| format!("A helyi aliastár sérült: {error}"))
+}
+
+fn write_learned_aliases(app: &AppHandle, aliases: &[LearnedAlias]) -> Result<(), String> {
+    let path = learned_alias_path(app)?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "Érvénytelen aliastár-útvonal.".to_string())?;
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("Az aliastár mappája nem hozható létre: {error}"))?;
+    let contents = serde_json::to_vec_pretty(aliases)
+        .map_err(|error| format!("Az aliastár nem alakítható át: {error}"))?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, contents)
+        .map_err(|error| format!("Az aliastár nem menthető: {error}"))?;
+    fs::rename(&temporary, &path)
+        .map_err(|error| format!("Az aliastár nem véglegesíthető: {error}"))
+}
+
+fn alias_matches(alias: &LearnedAlias, search_name: &str, role: &str) -> bool {
+    alias.role == role
+        && normalize_for_search(&alias.search_name) == normalize_for_search(search_name)
+}
+
+/// A jóváhagyott kódok, ha vannak. Ez az egyetlen pont, ahol a tanult alias
+/// életbe lép, és kizárólag `approved` állapotot fogad el.
+fn approved_alias_codes(
+    app: &AppHandle,
+    search_name: &str,
+    role: &str,
+) -> Option<(String, Vec<String>)> {
+    let aliases = read_learned_aliases(app).unwrap_or_default();
+    aliases
+        .iter()
+        .rev()
+        .find(|alias| {
+            alias.status == "approved"
+                && !alias.codes.is_empty()
+                && alias_matches(alias, search_name, role)
+        })
+        .map(|alias| (alias.label.clone(), alias.codes.clone()))
+}
+
+/// Jóváhagyásra váró bejegyzés felvétele, amikor a feloldás több céget talált.
+/// Ugyanarra a névre és szerepre nem gyűjt duplikátumot.
+fn record_pending_alias(
+    app: &AppHandle,
+    search_name: &str,
+    role: &str,
+    candidates: &[(String, String)],
+) {
+    if candidates.len() < 2 {
+        return;
+    }
+    let Ok(_guard) = ALIAS_FILE_LOCK.lock() else {
+        return;
+    };
+    let mut aliases = read_learned_aliases(app).unwrap_or_default();
+    if aliases
+        .iter()
+        .any(|alias| alias.status != "rejected" && alias_matches(alias, search_name, role))
+    {
+        return;
+    }
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    aliases.push(LearnedAlias {
+        id: format!("alias-{created_at}-{}", std::process::id()),
+        created_at,
+        search_name: search_name.trim().into(),
+        role: role.into(),
+        codes: Vec::new(),
+        label: search_name.trim().into(),
+        candidates: candidates
+            .iter()
+            .take(20)
+            .map(|(code, label)| LearnedAliasCandidate {
+                code: code.clone(),
+                label: label.clone(),
+            })
+            .collect(),
+        status: "pending".into(),
+    });
+    if aliases.len() > 200 {
+        let remove_count = aliases.len() - 200;
+        aliases.drain(0..remove_count);
+    }
+    let _ = write_learned_aliases(app, &aliases);
+}
+
+#[tauri::command]
+fn load_learned_aliases(app: AppHandle) -> Result<Vec<LearnedAlias>, String> {
+    let _guard = ALIAS_FILE_LOCK
+        .lock()
+        .map_err(|_| "A helyi aliastár zárolása sikertelen.".to_string())?;
+    let mut aliases = read_learned_aliases(&app)?;
+    aliases.sort_by_key(|alias| Reverse(alias.created_at));
+    Ok(aliases)
+}
+
+/// A jóváhagyási kapu. A kódoknak a rögzített jelöltek közül kell jönniük,
+/// így a felület nem tud olyan kódot bejuttatni, amit az adatbázis-feloldás
+/// nem talált meg.
+#[tauri::command]
+fn approve_learned_alias(
+    app: AppHandle,
+    alias_id: String,
+    codes: Vec<String>,
+) -> Result<Vec<LearnedAlias>, String> {
+    if codes.is_empty() {
+        return Err("Legalább egy kódot ki kell választani a jóváhagyáshoz.".into());
+    }
+    let _guard = ALIAS_FILE_LOCK
+        .lock()
+        .map_err(|_| "A helyi aliastár zárolása sikertelen.".to_string())?;
+    let mut aliases = read_learned_aliases(&app)?;
+    let alias = aliases
+        .iter_mut()
+        .find(|alias| alias.id == alias_id)
+        .ok_or_else(|| "Nincs ilyen aliasbejegyzés.".to_string())?;
+    let allowed = alias
+        .candidates
+        .iter()
+        .map(|candidate| candidate.code.as_str())
+        .collect::<HashSet<_>>();
+    if let Some(unknown) = codes.iter().find(|code| !allowed.contains(code.as_str())) {
+        return Err(format!(
+            "A {unknown} kód nem szerepelt a feloldás jelöltjei között, ezért nem hagyható jóvá."
+        ));
+    }
+    alias.label = alias
+        .candidates
+        .iter()
+        .find(|candidate| candidate.code == codes[0])
+        .map(|candidate| candidate.label.clone())
+        .unwrap_or_else(|| alias.search_name.clone());
+    alias.codes = codes;
+    alias.status = "approved".into();
+    let updated = aliases.clone();
+    write_learned_aliases(&app, &aliases)?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn reject_learned_alias(app: AppHandle, alias_id: String) -> Result<Vec<LearnedAlias>, String> {
+    let _guard = ALIAS_FILE_LOCK
+        .lock()
+        .map_err(|_| "A helyi aliastár zárolása sikertelen.".to_string())?;
+    let mut aliases = read_learned_aliases(&app)?;
+    let alias = aliases
+        .iter_mut()
+        .find(|alias| alias.id == alias_id)
+        .ok_or_else(|| "Nincs ilyen aliasbejegyzés.".to_string())?;
+    alias.codes = Vec::new();
+    alias.status = "rejected".into();
+    let updated = aliases.clone();
+    write_learned_aliases(&app, &aliases)?;
+    Ok(updated)
+}
+
+/// A kérdés tartalmi kulcsai a hasonlóságkereséshez. A magyar ragozást
+/// előtagvágással kezeljük: nincs szótövező függőség, és a visszatérő
+/// megfogalmazások így is egymásra illeszkednek.
+fn memory_terms(text: &str) -> HashSet<String> {
+    normalize_for_search(text)
+        .split_whitespace()
+        .filter(|term| term.len() >= 3 && !HUNGARIAN_STOP_WORDS.contains(term))
+        .map(|term| term.chars().take(MEMORY_TERM_PREFIX).collect::<String>())
+        .collect()
+}
+
+/// Jaccard-hasonlóság két kérdés kulcskészletén.
+fn question_similarity(left: &HashSet<String>, right: &HashSet<String>) -> f64 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let intersection = left.intersection(right).count() as f64;
+    let union = left.union(right).count() as f64;
+    intersection / union
+}
+
+/// A visszajelzésekből felépített, kérdéshez szabott memória (1-2. réteg).
+///
+/// Ez az, ami eddig hiányzott: a visszajelzés eltárolta a kérdést, az SQL-t
+/// és a javítást, de soha semmi nem olvasta vissza a promptba. A modell
+/// súlyai nem tanulnak; amit itt építünk, az visszakeresett tapasztalat.
+///
+/// Szándékosan csak TÁMPONT kerül a promptba: a végleges SQL ugyanúgy
+/// átmegy a `validate_planned_sql` üzleti ellenőrzésen, ezért egy téves
+/// visszajelzés nem tud szabályt felülírni.
+fn memory_prompt_context(records: &[AnalysisFeedbackRecord], question: &str) -> String {
+    let question_terms = memory_terms(question);
+    if question_terms.is_empty() {
+        return String::new();
+    }
+
+    let mut examples = Vec::new();
+    let mut pitfalls = Vec::new();
+    for record in records {
+        let similarity = question_similarity(&question_terms, &memory_terms(&record.question));
+        if similarity < MEMORY_MIN_SIMILARITY {
+            continue;
+        }
+        match record.rating.as_str() {
+            "positive" if record.status != "rejected" => {
+                if let Some(sql) = record
+                    .sql
+                    .as_ref()
+                    .map(|sql| sql.trim())
+                    .filter(|sql| !sql.is_empty())
+                {
+                    examples.push((similarity, record, sql.to_string()));
+                }
+            }
+            "negative" if !record.correction.trim().is_empty() => {
+                pitfalls.push((similarity, record));
+            }
+            _ => {}
+        }
+    }
+
+    // A legfrissebb tapasztalat döntsön egyenlő hasonlóságnál.
+    examples.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then(right.1.created_at.cmp(&left.1.created_at))
+    });
+    pitfalls.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then(right.1.created_at.cmp(&left.1.created_at))
+    });
+    examples.truncate(MAX_MEMORY_EXAMPLES);
+    pitfalls.truncate(MAX_MEMORY_PITFALLS);
+
+    if examples.is_empty() && pitfalls.is_empty() {
+        return String::new();
+    }
+
+    let mut context = String::from(
+        "Tanult tapasztalat a korábbi, felhasználói visszajelzéssel ellenőrzött kérdésekből.\n\
+         Ezek TÁMPONTOK, nem szabályok: ha ütköznek a sémával vagy az üzleti definíciókkal, a séma és az üzleti definíció az erősebb.\n",
+    );
+    if !examples.is_empty() {
+        context.push_str("\nHelyesnek jelölt korábbi lekérdezések hasonló kérdésekre:\n");
+        for (index, (_, record, sql)) in examples.iter().enumerate() {
+            context.push_str(&format!(
+                "{}. Kérdés: {}\n   Elfogadott SQL: {}\n",
+                index + 1,
+                record.question,
+                sql.chars()
+                    .take(MEMORY_EXAMPLE_SQL_CHARACTERS)
+                    .collect::<String>()
+            ));
+        }
+    }
+    if !pitfalls.is_empty() {
+        context.push_str(
+            "\nKorábban jelzett hibák hasonló kérdéseknél — ezeket kifejezetten kerüld el:\n",
+        );
+        for (_, record) in &pitfalls {
+            context.push_str(&format!(
+                "- Kérdés: {}\n  Kategória: {}\n  A felhasználó javítása: {}\n",
+                record.question,
+                record.category.as_deref().unwrap_or("nincs megadva"),
+                record
+                    .correction
+                    .chars()
+                    .take(MEMORY_CORRECTION_CHARACTERS)
+                    .collect::<String>()
+            ));
+        }
+    }
+    context
+}
+
+/// Csak az összefoglalót érintő korábbi javítások. Az az eset, amikor az SQL
+/// jó volt, de a szöveges válasz félreértelmezte az eredményt.
+fn summary_pitfall_context(records: &[AnalysisFeedbackRecord], question: &str) -> String {
+    let question_terms = memory_terms(question);
+    if question_terms.is_empty() {
+        return String::new();
+    }
+    let mut pitfalls = records
+        .iter()
+        .filter(|record| {
+            record.rating == "negative"
+                && record.category.as_deref() == Some("summary")
+                && !record.correction.trim().is_empty()
+        })
+        .map(|record| {
+            (
+                question_similarity(&question_terms, &memory_terms(&record.question)),
+                record,
+            )
+        })
+        .filter(|(similarity, _)| *similarity >= MEMORY_MIN_SIMILARITY)
+        .collect::<Vec<_>>();
+    pitfalls.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then(right.1.created_at.cmp(&left.1.created_at))
+    });
+    pitfalls.truncate(MAX_MEMORY_PITFALLS);
+    if pitfalls.is_empty() {
+        return String::new();
+    }
+
+    let mut context = String::from(
+        "Korábban az összefoglalóra adott javítások hasonló kérdéseknél — ezeket vedd figyelembe:\n",
+    );
+    for (_, record) in pitfalls {
+        context.push_str(&format!(
+            "- {}\n",
+            record
+                .correction
+                .chars()
+                .take(MEMORY_CORRECTION_CHARACTERS)
+                .collect::<String>()
+        ));
+    }
+    context
 }
 
 fn validate_feedback(input: &AnalysisFeedbackInput) -> Result<(), String> {
@@ -2025,10 +2451,7 @@ fn business_relationship_skill(question: &str) -> &'static str {
 }
 
 fn schema_search_terms(question: &str, history: &[HistoryMessage]) -> HashSet<String> {
-    let stop_words = [
-        "adat", "adatok", "alapjan", "az", "egy", "es", "hogy", "kerlek", "legyen", "meg", "mely",
-        "melyik", "mi", "mind", "mutasd", "osszes", "szerint", "van", "volt",
-    ];
+    let stop_words = HUNGARIAN_STOP_WORDS;
     let mut search_text = history
         .iter()
         .rev()
@@ -2770,6 +3193,8 @@ struct SummaryContext<'a> {
     period_note: String,
     /// A feloldott vevő/végfelhasználó kódjai, ha volt feloldás.
     entity_note: Option<String>,
+    /// Korábbi, kifejezetten az összefoglalóra adott javítások (2. réteg).
+    summary_pitfalls: String,
     history: &'a [HistoryMessage],
 }
 
@@ -3140,11 +3565,14 @@ async fn plan_with_tools(
     let mut probes_left = MAX_PROBE_QUERIES;
 
     for round in 1..=MAX_PLANNER_TOOL_ROUNDS {
+        // Az utolsó körben a kötelező eszközhívás már csak a terv leadása
+        // lehet; különben a modell korlátlanul keresgélhet a sémában.
+        let available_tools = planner_tools_for_round(round);
         let mut request = json!({
             "model": settings.ai_model,
             "instructions": system,
             "input": input,
-            "tools": planner_tools(),
+            "tools": available_tools,
             "tool_choice": "required",
             "max_output_tokens": options.max_output_tokens,
             "store": false
@@ -3327,6 +3755,18 @@ fn planner_tools() -> JsonValue {
             }
         }
     ])
+}
+
+fn planner_tools_for_round(round: usize) -> Vec<JsonValue> {
+    let tools = planner_tools().as_array().cloned().unwrap_or_default();
+    if round == MAX_PLANNER_TOOL_ROUNDS {
+        tools
+            .into_iter()
+            .filter(|tool| tool["name"].as_str() == Some("submit_plan"))
+            .collect()
+    } else {
+        tools
+    }
 }
 
 /// Egy eszközhívás végrehajtása. A visszaadott szöveg a modellhez kerül,
@@ -3763,6 +4203,7 @@ async fn summarize_query_result(
         fy_window_start,
         period_note,
         entity_note,
+        summary_pitfalls,
         history,
     } = context;
     let preview_rows = rows.iter().take(SUMMARY_PREVIEW_ROWS).collect::<Vec<_>>();
@@ -3812,6 +4253,12 @@ Soronkénti előnézet, az első {} sor (JSON, legfeljebb {} karakter), csak ill
     );
     if let Some(entity_note) = entity_note {
         summary_user.push_str(&format!("\n\nFeloldott entitás: {entity_note}"));
+    }
+    if !summary_pitfalls.is_empty() {
+        summary_user.push_str(&format!("\n\n{summary_pitfalls}"));
+    }
+    if sql.to_ascii_lowercase().contains("invoiceallocationline") {
+        summary_user.push_str("\n\nKötelező értelmezési korlát: ez kizárólag a könyvelt bejövő számlák nettó alapdevizás felosztása, nem a cég teljes működési költsége. Az 5-ös és 8-as főkönyvi számlaosztályra kerülő részek költség-/ráfordításjelöltek, nem auditált OPEX. A bérek, értékcsökkenés és más, számla nélkül könyvelt tételek hiányozhatnak. A számlaosztályok közötti átsorolásokat és előjeleket külön főkönyvi egyeztetés nélkül ne értelmezd végleges költségként. Ezt a korlátot a válasz első bekezdésében mondd ki.");
     }
     if !history_text.is_empty() {
         summary_user.push_str(&format!(
@@ -3865,7 +4312,92 @@ async fn analyze_quick_erp(
             fy_window_start: format!("{}-01-01", scope.window_start_year),
             period_note: scope.summary_note(analysis_fy_window),
             entity_note: None,
+            summary_pitfalls: summary_pitfall_context(
+                &read_feedback_records(&app).unwrap_or_default(),
+                question.trim(),
+            ),
             history: &[],
+        },
+    )
+    .await?;
+    let row_count = rows.len();
+
+    Ok(AnalyzeResponse {
+        summary: summary_call.content,
+        result: Some(QueryResult {
+            kind: "query-result",
+            title: plan.title,
+            visualization: plan.visualization,
+            columns,
+            rows,
+            row_count,
+            truncated,
+            sql,
+            query_source: "fixed",
+            token_usage: summary_call.usage,
+            schema_selection: SchemaSelectionStats {
+                total_tables: 0,
+                total_columns: 0,
+                selected_tables: 0,
+                selected_columns: 0,
+                context_characters: 0,
+            },
+        }),
+    })
+}
+
+/// A fix relációs tervek közös végrehajtási útja. Azért külön függvény,
+/// mert a jóváhagyott aliasból érkező terv is pontosan ezt futtatja.
+struct RelationshipAnalysis<'a> {
+    settings: &'a StoredSettings,
+    api_key: &'a str,
+    mysql_password: String,
+    question: &'a str,
+    history: &'a [HistoryMessage],
+    feedback_records: &'a [AnalysisFeedbackRecord],
+    entity_note: Option<String>,
+    purchase_fy_window: u8,
+    plan: QueryPlan,
+}
+
+async fn finish_relationship_analysis(
+    analysis: RelationshipAnalysis<'_>,
+) -> Result<AnalyzeResponse, String> {
+    let RelationshipAnalysis {
+        settings,
+        api_key,
+        mysql_password,
+        question,
+        history,
+        feedback_records,
+        entity_note,
+        purchase_fy_window,
+        mut plan,
+    } = analysis;
+
+    if requests_chart(question) && is_customer_purchase_question(question) {
+        plan.visualization = "bar".into();
+    }
+    let sql = validate_planned_sql(question, &plan.sql)?;
+    let (columns, rows, truncated) =
+        run_query(settings, mysql_password, &sql, plan.max_rows).await?;
+    let scope = PeriodScope::resolve(question, purchase_fy_window);
+    let summary_call = summarize_query_result(
+        settings,
+        api_key,
+        SummaryContext {
+            question,
+            title: &plan.title,
+            sql: &sql,
+            columns: &columns,
+            rows: &rows,
+            truncated,
+            analysis_fy_window: purchase_fy_window,
+            fy_window_start: format!("{}-01-01", scope.window_start_year),
+            period_note: scope.summary_note(purchase_fy_window),
+            entity_note,
+            summary_pitfalls: summary_pitfall_context(feedback_records, question),
+            history,
         },
     )
     .await?;
@@ -3927,9 +4459,37 @@ async fn analyze_erp(
     let api_key = read_secret(&app, "AI_API_KEY", AI_API_KEY_ACCOUNT, "AI API-kulcs")?;
     let analysis_fy_window = validate_analysis_fy_window(settings.analysis_fy_window)?;
     let purchase_fy_window = purchase_fy_window(question.trim(), analysis_fy_window);
+    // Legjobb szándékú betöltés: sérült vagy hiányzó memóriafájl miatt ne
+    // hasaljon el a kérdés, csak maradjon el a tanult tapasztalat.
+    let feedback_records = read_feedback_records(&app).unwrap_or_default();
     let billed_customer_name = explicit_billed_customer_name(question.trim());
     let mut entity_note: Option<String> = None;
     let mut relationship_plan = if let Some(search_name) = billed_customer_name {
+        // 3. réteg: a jóváhagyott alias felülírja a név szerinti keresést, így
+        // ugyanarra a cégre nem kérdez vissza minden alkalommal.
+        if let Some((label, codes)) = approved_alias_codes(&app, &search_name, "billed_customer") {
+            entity_note = Some(format!(
+                "számlázott vevő „{label}” jóváhagyott aliasból, ügyfélkódok: {}",
+                codes.join(", ")
+            ));
+            return finish_relationship_analysis(RelationshipAnalysis {
+                settings: &settings,
+                api_key: &api_key,
+                mysql_password,
+                question: question.trim(),
+                history: &history,
+                feedback_records: &feedback_records,
+                entity_note,
+                purchase_fy_window,
+                plan: billed_customer_purchase_plan(
+                    &label,
+                    &codes,
+                    purchase_fy_window,
+                    is_english_question(question.trim()),
+                ),
+            })
+            .await;
+        }
         let matches =
             resolve_billed_customer(&settings, mysql_password.clone(), &search_name).await?;
         if matches.is_empty() {
@@ -3949,11 +4509,14 @@ async fn analyze_erp(
                 .map(|(code, name)| format!("{name} ({code})"))
                 .collect::<Vec<_>>()
                 .join("; ");
+            // Jóváhagyásra váró bejegyzés, hogy a következő alkalommal már
+            // ne kelljen visszakérdezni ugyanerre a névre.
+            record_pending_alias(&app, &search_name, "billed_customer", &matches);
             return Ok(AnalyzeResponse {
                 summary: if is_english_question(question.trim()) {
-                    format!("I found several invoiced customers matching {search_name}: {candidates}. Which one do you mean? Please use the customer code if possible.")
+                    format!("I found several invoiced customers matching {search_name}: {candidates}. Which one do you mean? Please use the customer code if possible. You can also approve the right one for good under Settings / Knowledge and corrections.")
                 } else {
-                    format!("Több számlázott vevő is illik erre: {search_name}. Találatok: {candidates}. Melyikre gondolsz? Ha lehet, add meg az ügyfélkódot.")
+                    format!("Több számlázott vevő is illik erre: {search_name}. Találatok: {candidates}. Melyikre gondolsz? Ha lehet, add meg az ügyfélkódot. A helyes céget a Beállítások / Tudás és javítások alatt véglegesen is jóváhagyhatod.")
                 },
                 result: None,
             });
@@ -3974,11 +4537,36 @@ async fn analyze_erp(
             is_english_question(question.trim()),
         ))
     } else {
-        top_end_customers_plan(question.trim(), analysis_fy_window)
+        incoming_operating_cost_plan(question.trim(), analysis_fy_window)
+            .or_else(|| top_end_customers_plan(question.trim(), analysis_fy_window))
             .or_else(|| fixed_relationship_plan(question.trim(), purchase_fy_window))
     };
     if relationship_plan.is_none() {
         if let Some(search_name) = explicit_end_customer_name(question.trim()) {
+            if let Some((label, codes)) = approved_alias_codes(&app, &search_name, "end_customer") {
+                entity_note = Some(format!(
+                    "végfelhasználó „{label}” jóváhagyott aliasból, entitáskódok: {}",
+                    codes.join(", ")
+                ));
+                let mut plan = end_customer_purchase_plan(&label, &codes, purchase_fy_window);
+                if is_english_question(question.trim()) {
+                    plan.title = format!(
+                        "Products purchased by {label} as end customer — last {purchase_fy_window} FY"
+                    );
+                }
+                return finish_relationship_analysis(RelationshipAnalysis {
+                    settings: &settings,
+                    api_key: &api_key,
+                    mysql_password,
+                    question: question.trim(),
+                    history: &history,
+                    feedback_records: &feedback_records,
+                    entity_note,
+                    purchase_fy_window,
+                    plan,
+                })
+                .await;
+            }
             let matches =
                 resolve_end_customer(&settings, mysql_password.clone(), &search_name).await?;
             if matches.is_empty() {
@@ -4004,11 +4592,12 @@ async fn analyze_erp(
                     .map(|(code, name)| format!("{name} ({code})"))
                     .collect::<Vec<_>>()
                     .join("; ");
+                record_pending_alias(&app, &search_name, "end_customer", &matches);
                 return Ok(AnalyzeResponse {
                     summary: if is_english_question(question.trim()) {
-                        format!("I found several end customers matching {search_name}: {candidates}. Which one do you mean?")
+                        format!("I found several end customers matching {search_name}: {candidates}. Which one do you mean? You can also approve the right one for good under Settings / Knowledge and corrections.")
                     } else {
-                        format!("Több végfelhasználó is illik erre: {search_name}. Találatok: {candidates}. Melyikre gondolsz?")
+                        format!("Több végfelhasználó is illik erre: {search_name}. Találatok: {candidates}. Melyikre gondolsz? A helyes céget a Beállítások / Tudás és javítások alatt véglegesen is jóváhagyhatod.")
                     },
                     result: None,
                 });
@@ -4031,55 +4620,19 @@ async fn analyze_erp(
             relationship_plan = Some(plan);
         }
     }
-    if let Some(mut plan) = relationship_plan {
-        if requests_chart(question.trim()) && is_customer_purchase_question(question.trim()) {
-            plan.visualization = "bar".into();
-        }
-        let sql = validate_planned_sql(question.trim(), &plan.sql)?;
-        let (columns, rows, truncated) =
-            run_query(&settings, mysql_password, &sql, plan.max_rows).await?;
-        let scope = PeriodScope::resolve(question.trim(), purchase_fy_window);
-        let summary_call = summarize_query_result(
-            &settings,
-            &api_key,
-            SummaryContext {
-                question: question.trim(),
-                title: &plan.title,
-                sql: &sql,
-                columns: &columns,
-                rows: &rows,
-                truncated,
-                analysis_fy_window: purchase_fy_window,
-                fy_window_start: format!("{}-01-01", scope.window_start_year),
-                period_note: scope.summary_note(purchase_fy_window),
-                entity_note: entity_note.clone(),
-                history: &history,
-            },
-        )
-        .await?;
-        let row_count = rows.len();
-        return Ok(AnalyzeResponse {
-            summary: summary_call.content,
-            result: Some(QueryResult {
-                kind: "query-result",
-                title: plan.title,
-                visualization: plan.visualization,
-                columns,
-                rows,
-                row_count,
-                truncated,
-                sql,
-                query_source: "fixed",
-                token_usage: summary_call.usage,
-                schema_selection: SchemaSelectionStats {
-                    total_tables: 0,
-                    total_columns: 0,
-                    selected_tables: 0,
-                    selected_columns: 0,
-                    context_characters: 0,
-                },
-            }),
-        });
+    if let Some(plan) = relationship_plan {
+        return finish_relationship_analysis(RelationshipAnalysis {
+            settings: &settings,
+            api_key: &api_key,
+            mysql_password,
+            question: question.trim(),
+            history: &history,
+            feedback_records: &feedback_records,
+            entity_note,
+            purchase_fy_window,
+            plan,
+        })
+        .await;
     }
     let catalog = load_schema_catalog(&app, &settings, mysql_password.clone()).await?;
     let (schema_context, schema_selection) =
@@ -4095,8 +4648,11 @@ async fn analyze_erp(
     // A prompt-cache csak a szó szerint egyező előtagra illeszkedik, ezért a
     // kérdésfüggő rész (időszak, reláció-skill, séma) a változatlan blokk
     // UTÁN következik, nem a közepébe tűzve.
+    // A tanult memória a kérdéstől függ, ezért a statikus előtag UTÁN
+    // következik — különben minden kérdés cache-tévesztéssel indulna.
+    let memory_context = memory_prompt_context(&feedback_records, question.trim());
     let planner_system = format!(
-        "{}\n\n--- A kérdéshez tartozó rész ---\nIdőszakszabály:\n{}\n\n{relationship_skill}\n\n{schema_context}",
+        "{}\n\n--- A kérdéshez tartozó rész ---\nIdőszakszabály:\n{}\n\n{relationship_skill}\n\n{memory_context}\n{schema_context}",
         planner_static_instructions(),
         period_scope.planner_rule(analysis_fy_window, &fiscal_year_start),
     );
@@ -4209,7 +4765,8 @@ Javítsd ki a tervet. Ha a hiba ismeretlen táblára vagy oszlopra utal, kizár�
             analysis_fy_window,
             fy_window_start: format!("{}-01-01", period_scope.window_start_year),
             period_note: period_scope.summary_note(analysis_fy_window),
-            entity_note: None,
+            entity_note: entity_note.clone(),
+            summary_pitfalls: summary_pitfall_context(&feedback_records, question.trim()),
             history: &history,
         },
     )
@@ -4254,7 +4811,10 @@ pub fn run() {
             save_analysis_feedback,
             save_settings,
             select_ai_model,
-            select_analysis_fy_window
+            select_analysis_fy_window,
+            load_learned_aliases,
+            approve_learned_alias,
+            reject_learned_alias
         ])
         .run(tauri::generate_context!())
         .expect("az ERGO alkalmazás nem indítható");
@@ -4263,19 +4823,23 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ambiguous_purchase_company_name, assert_read_only_sql, billed_customer_purchase_plan,
-        business_relationship_skill, capability_answer, civil_date_from_unix,
-        clarified_purchase_question, contains_token_phrase, describe_table_tool,
-        end_customer_purchase_plan, explicit_billed_customer_name, explicit_end_customer_name,
-        extract_json, fixed_quick_plan, fixed_relationship_plan, fy_window_years, is_chat_model,
+        alias_matches, ambiguous_purchase_company_name, assert_read_only_sql,
+        billed_customer_purchase_plan, business_relationship_skill, capability_answer,
+        civil_date_from_unix, clarified_purchase_question, contains_token_phrase,
+        describe_table_tool, end_customer_purchase_plan, explicit_billed_customer_name,
+        explicit_end_customer_name, extract_json, fixed_quick_plan, fixed_relationship_plan,
+        fy_window_years, incoming_operating_cost_plan, is_chat_model,
         is_customer_purchase_question, is_english_question, is_sampleable_column, knowledge_pack,
-        knowledge_prompt_context, normalize_for_search, percent_encode_mailto, planner_tools,
-        purchase_fy_window, purchase_role_clarification, requested_top_end_customer_limit,
+        knowledge_prompt_context, memory_prompt_context, memory_terms, normalize_for_search,
+        percent_encode_mailto, planner_tools, planner_tools_for_round, purchase_fy_window,
+        purchase_role_clarification, question_similarity, requested_top_end_customer_limit,
         requests_chart, resolve_end_customer, responses_input, result_statistics, run_query,
-        schema_search_terms, search_schema_tool, select_schema_context, table_business_metadata,
-        top_end_customers_plan, validate_analysis_fy_window, validate_feedback, validate_model,
-        validate_planned_sql, AnalysisFeedbackInput, CatalogColumn, HistoryMessage, JsonValue,
-        PeriodScope, QueryPlan, SchemaCatalog, SchemaTable, StoredSettings,
+        schema_search_terms, search_schema_tool, select_schema_context, summary_pitfall_context,
+        table_business_metadata, top_end_customers_plan, validate_analysis_fy_window,
+        validate_feedback, validate_model, validate_planned_sql, AnalysisFeedbackInput,
+        AnalysisFeedbackRecord, CatalogColumn, HistoryMessage, JsonValue, LearnedAlias,
+        LearnedAliasCandidate, PeriodScope, QueryPlan, SchemaCatalog, SchemaTable, StoredSettings,
+        MEMORY_MIN_SIMILARITY,
     };
 
     #[test]
@@ -4291,6 +4855,34 @@ mod tests {
         assert!(assert_read_only_sql("DELETE FROM invoices").is_err());
         assert!(assert_read_only_sql("SELECT 1; SELECT 2").is_err());
         assert!(assert_read_only_sql("SELECT SLEEP(10)").is_err());
+    }
+
+    #[test]
+    fn incoming_invoice_operating_cost_uses_a_bounded_fixed_plan() {
+        let question =
+            "Elemezd ki a beérkező számlákat és próbáld meg kiszámolni a cég működési költségeit";
+        let plan = incoming_operating_cost_plan(question, 3).expect("fixed cost candidate plan");
+        assert!(plan.sql.contains("FROM invoiceallocationline l"));
+        assert!(plan.sql.contains("l.companynumber = '1' AND l.posted = 1"));
+        assert!(plan.sql.contains("l.amountbase"));
+        assert!(plan.sql.contains("l.accountnumber LIKE '5%'"));
+        assert!(plan.sql.contains("MAKEDATE(YEAR(CURRENT_DATE) - 2, 1)"));
+        assert_eq!(plan.max_rows, 60);
+        assert!(validate_planned_sql(question, &plan.sql).is_ok());
+        assert!(incoming_operating_cost_plan("Mennyi volt a működési költség?", 3).is_none());
+        assert!(incoming_operating_cost_plan(
+            "Elemezd a bejövő számlákat és a működési költségeket 2024-ben",
+            3
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn final_planning_round_only_allows_submitting_the_plan() {
+        assert!(planner_tools_for_round(1).len() > 1);
+        let final_tools = planner_tools_for_round(super::MAX_PLANNER_TOOL_ROUNDS);
+        assert_eq!(final_tools.len(), 1);
+        assert_eq!(final_tools[0]["name"], "submit_plan");
     }
 
     #[test]
@@ -5179,6 +5771,168 @@ mod tests {
             "{described}"
         );
         assert!(describe_table_tool(&catalog, "nincsilyen").contains("Nincs ilyen tábla"));
+    }
+
+    fn feedback_fixture(
+        rating: &str,
+        question: &str,
+        sql: Option<&str>,
+        correction: &str,
+        category: Option<&str>,
+        created_at: u64,
+    ) -> AnalysisFeedbackRecord {
+        AnalysisFeedbackRecord {
+            id: format!("feedback-{created_at}"),
+            created_at,
+            app_version: "test".into(),
+            model: "gpt-6-sol".into(),
+            analysis_fy_window: 3,
+            rating: rating.into(),
+            category: category.map(str::to_owned),
+            correction: correction.into(),
+            question: question.into(),
+            answer: "válasz".into(),
+            result_title: None,
+            sql: sql.map(str::to_owned),
+            query_source: Some("generated".into()),
+            row_count: Some(3),
+            status: "recorded".into(),
+        }
+    }
+
+    #[test]
+    fn similar_questions_match_through_hungarian_inflection() {
+        let asked = memory_terms("Mennyi volt az árbevétel 2024-ben?");
+        let stored = memory_terms("Mutasd az árbevételt 2024 évre");
+        // Az "arbevetel" és az "arbevetelt" előtagvágás után egybeesik.
+        assert!(
+            question_similarity(&asked, &stored) >= MEMORY_MIN_SIMILARITY,
+            "{asked:?} vs {stored:?}"
+        );
+        let unrelated = memory_terms("Kik a legnagyobb beszállítóink?");
+        assert!(question_similarity(&asked, &unrelated) < MEMORY_MIN_SIMILARITY);
+    }
+
+    #[test]
+    fn memory_offers_verified_examples_and_known_pitfalls() {
+        let records = vec![
+            feedback_fixture(
+                "positive",
+                "Mennyi volt az árbevétel 2024-ben?",
+                Some("SELECT SUM(itemsumbase) FROM invoice WHERE companynumber = '1'"),
+                "",
+                None,
+                1,
+            ),
+            feedback_fixture(
+                "negative",
+                "Mutasd az árbevételt 2024 évre",
+                None,
+                "A jóváírásokat le kell vonni.",
+                Some("metric"),
+                2,
+            ),
+            feedback_fixture(
+                "positive",
+                "Kik a legnagyobb beszállítóink?",
+                Some("SELECT vendornumber FROM vendor"),
+                "",
+                None,
+                3,
+            ),
+        ];
+        let context = memory_prompt_context(&records, "Mennyi az árbevétel 2024-ben?");
+        assert!(context.contains("Elfogadott SQL"), "{context}");
+        assert!(context.contains("itemsumbase"), "{context}");
+        assert!(
+            context.contains("A jóváírásokat le kell vonni."),
+            "{context}"
+        );
+        // A nem kapcsolódó kérdés példája nem kerül be.
+        assert!(!context.contains("vendornumber"), "{context}");
+        // A tapasztalat csak támpont; az üzleti szabály az erősebb.
+        assert!(context.contains("TÁMPONTOK, nem szabályok"), "{context}");
+    }
+
+    #[test]
+    fn rejected_and_sqlless_feedback_never_becomes_an_example() {
+        let mut rejected = feedback_fixture(
+            "positive",
+            "Mennyi volt az árbevétel 2024-ben?",
+            Some("SELECT 1"),
+            "",
+            None,
+            1,
+        );
+        rejected.status = "rejected".into();
+        let without_sql = feedback_fixture(
+            "positive",
+            "Mennyi volt az árbevétel 2024-ben?",
+            None,
+            "",
+            None,
+            2,
+        );
+        let context =
+            memory_prompt_context(&[rejected, without_sql], "Mennyi az árbevétel 2024-ben?");
+        assert!(context.is_empty(), "{context}");
+    }
+
+    #[test]
+    fn only_summary_corrections_reach_the_summarizer() {
+        let records = vec![
+            feedback_fixture(
+                "negative",
+                "Mennyi volt az árbevétel 2024-ben?",
+                None,
+                "Az összeget ezer forintban írd ki.",
+                Some("summary"),
+                1,
+            ),
+            feedback_fixture(
+                "negative",
+                "Mennyi volt az árbevétel 2024-ben?",
+                None,
+                "Rossz táblát használt.",
+                Some("relationship"),
+                2,
+            ),
+        ];
+        let context = summary_pitfall_context(&records, "Mennyi az árbevétel 2024-ben?");
+        assert!(context.contains("ezer forintban"), "{context}");
+        assert!(!context.contains("Rossz táblát"), "{context}");
+    }
+
+    #[test]
+    fn learned_alias_matching_respects_role_and_approval() {
+        let pending = LearnedAlias {
+            id: "alias-1".into(),
+            created_at: 1,
+            search_name: "OBH".into(),
+            role: "end_customer".into(),
+            codes: Vec::new(),
+            label: "OBH".into(),
+            candidates: vec![
+                LearnedAliasCandidate {
+                    code: "birosag".into(),
+                    label: "Országos Bírósági Hivatal".into(),
+                },
+                LearnedAliasCandidate {
+                    code: "obh".into(),
+                    label: "OBH Kft.".into(),
+                },
+            ],
+            status: "pending".into(),
+        };
+        // A jóváhagyásra váró bejegyzés nem azonosít céget.
+        assert!(pending.codes.is_empty());
+        assert_ne!(pending.status, "approved");
+        // A név illesztése kis-nagybetűtől és ragozástól független...
+        assert!(alias_matches(&pending, "obh", "end_customer"));
+        // ...a szerep viszont kötelezően egyezik: a számlázott vevő és a
+        // végfelhasználó két külön törzs, és soha nem keverhető össze.
+        assert!(!alias_matches(&pending, "obh", "billed_customer"));
+        assert!(!alias_matches(&pending, "one", "end_customer"));
     }
 
     #[test]

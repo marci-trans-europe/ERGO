@@ -203,6 +203,46 @@ azonosítóját a kapcsolati beállításokban kell módosítani.
 > beállított AI-szolgáltatóhoz kerül feldolgozásra. A választott szolgáltatói
 > fióknak meg kell felelnie a vállalati adatkezelési követelményeknek.
 
+## Tanulás a visszajelzésekből
+
+Az ERGO a visszajelzéseket nem csak eltárolja, hanem vissza is olvassa a
+promptba. A modell súlyai nem tanulnak; amit az app épít, az **visszakeresett
+tapasztalat**: a kérdéshez hasonló korábbi esetek bekerülnek a tervezés
+kontextusába.
+
+A hasonlóságot helyben, API-hívás nélkül számolja (Jaccard-hasonlóság a kérdés
+kulcsszavain). A magyar ragozást előtagvágás kezeli, így az „árbevétel” és az
+„árbevételt” egymásra illeszkedik.
+
+Három réteg, eltérő bizalmi szinttel:
+
+1. **Ellenőrzött lekérdezések.** Amit „helyes”-nek jelölsz és van hozzá SQL, az
+   hasonló kérdésnél bekerül a planner promptjába elfogadott példaként,
+   legfeljebb négy darab. Ez csak támpont: a végleges SQL ugyanúgy átmegy a
+   teljes biztonsági és üzleti ellenőrzésen, ezért egy téves visszajelzés nem
+   tud üzleti szabályt felülírni.
+2. **Ismert hibák.** A „javítandó” értékeléshez írt korrekció hasonló
+   kérdésnél figyelmeztetésként megy vissza. A kifejezetten `summary`
+   kategóriába sorolt javítások az összefoglaló promptjába is bekerülnek — ez
+   az az eset, amikor az SQL jó volt, de a szöveges válasz félreértelmezte az
+   eredményt.
+3. **Cégazonosítás, emberi jóváhagyással.** Ha egy kérdésnél több cég is illik
+   a megadott névre, az ERGO visszakérdez, és egyúttal jóváhagyásra váró
+   bejegyzést vesz fel. A **Beállítások → Tudás és javítások** alatt
+   kiválasztható a helyes cég, és onnantól az a név közvetlenül feloldódik,
+   visszakérdezés nélkül. Az érvényben lévő azonosítások ugyanitt
+   visszavonhatók.
+
+A harmadik réteg szándékosan nem automatikus: az dönti el, melyik cég adatait
+összegezzük, tehát közvetlenül befolyásolja a pénzügyi számokat. Jóváhagyás
+nélkül a bejegyzés egyetlen lekérdezést sem érint, és a jóváhagyás is csak
+olyan ERP-kódot fogad el, amelyet az adatbázis-feloldás tényleg megtalált. A
+modell egyik réteget sem írhatja.
+
+A tanult tapasztalat a `learned-aliases.json` és a meglévő
+`analysis-feedback.json` fájlban, helyben marad, és nem tartalmaz API-kulcsot,
+adatbázis-jelszót vagy nyers lekérdezési sort.
+
 ## Biztonsági modell
 
 1. A `TREU` adatbázis-felhasználó csak olvasási jogosultságú.

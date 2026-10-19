@@ -7,6 +7,7 @@ import type {
   ChatMessage,
   DesktopSettings,
   KnowledgeOverview,
+  LearnedAlias,
   ProductCatalog,
   ProductSales,
   QuickAnalysis,
@@ -74,6 +75,26 @@ export const saveAnalysisFeedback = async (
 export const loadKnowledgeOverview = async (): Promise<KnowledgeOverview> => {
   ensureDesktop()
   return invoke<KnowledgeOverview>('load_knowledge_overview')
+}
+
+export const loadLearnedAliases = async (): Promise<LearnedAlias[]> => {
+  ensureDesktop()
+  return invoke<LearnedAlias[]>('load_learned_aliases')
+}
+
+export const approveLearnedAlias = async (
+  aliasId: string,
+  codes: string[],
+): Promise<LearnedAlias[]> => {
+  ensureDesktop()
+  return invoke<LearnedAlias[]>('approve_learned_alias', { aliasId, codes })
+}
+
+export const rejectLearnedAlias = async (
+  aliasId: string,
+): Promise<LearnedAlias[]> => {
+  ensureDesktop()
+  return invoke<LearnedAlias[]>('reject_learned_alias', { aliasId })
 }
 
 export const loadProductCatalog = async (): Promise<ProductCatalog> => {

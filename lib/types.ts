@@ -116,6 +116,28 @@ export type KnowledgeOverview = {
   }>
 }
 
+export type LearnedAliasRole = 'end_customer' | 'billed_customer'
+
+export type LearnedAliasCandidate = {
+  code: string
+  label: string
+}
+
+/**
+ * Megtanult cégnév -> ERP-kód párosítás. A `pending` bejegyzés semmilyen
+ * lekérdezést nem befolyásol: csak az `approved` állapot lép életbe.
+ */
+export type LearnedAlias = {
+  id: string
+  createdAt: number
+  searchName: string
+  role: LearnedAliasRole
+  codes: string[]
+  label: string
+  candidates: LearnedAliasCandidate[]
+  status: 'pending' | 'approved' | 'rejected'
+}
+
 export type ProductCatalogPeriod = {
   itemNumber: string
   itemName: string

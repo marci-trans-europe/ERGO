@@ -1638,6 +1638,129 @@ button:disabled {
   background: #f3f5f2;
 }
 
+.knowledge-alias-block {
+  display: grid;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+
+.knowledge-alias-title {
+  color: var(--ink);
+  font-size: 0.68rem;
+  font-weight: 750;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.knowledge-alias-list {
+  display: grid;
+  max-height: 300px;
+  overflow: auto;
+  gap: 8px;
+}
+
+.knowledge-alias-list article {
+  display: grid;
+  gap: 6px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px 4px 11px 4px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.knowledge-alias-list article > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.knowledge-alias-list article > strong {
+  color: var(--ink);
+  font-size: 0.73rem;
+}
+
+.knowledge-alias-candidates {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.knowledge-alias-candidates label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.68rem;
+}
+
+.knowledge-alias-candidates code {
+  color: var(--accent);
+  font-size: 0.64rem;
+}
+
+.knowledge-alias-actions {
+  display: flex;
+  gap: 7px;
+}
+
+.knowledge-alias-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px 3px 8px 3px;
+  padding: 6px 9px;
+  background: white;
+  color: #596660;
+  cursor: pointer;
+  font-size: 0.64rem;
+  font-weight: 700;
+}
+
+.knowledge-alias-actions button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.knowledge-alias-approved {
+  display: grid;
+  gap: 5px;
+  padding: 9px 11px;
+  border-radius: 9px 3px 9px 3px;
+  background: #f3f5f2;
+  color: var(--muted);
+  font-size: 0.66rem;
+}
+
+.knowledge-alias-approved ul {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.knowledge-alias-approved li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.knowledge-alias-approved button {
+  border: none;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 0.63rem;
+  font-weight: 700;
+}
+
 .update-settings {
   display: grid;
   gap: 14px;

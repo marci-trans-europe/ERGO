@@ -1,10 +1,23 @@
 'use client'
 
-import { BookOpenCheck, LoaderCircle, Mail, RefreshCw } from 'lucide-react'
+import {
+  BookOpenCheck,
+  Check,
+  LoaderCircle,
+  Mail,
+  RefreshCw,
+  X,
+} from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 
-import { emailAnalysisFeedback, loadKnowledgeOverview } from '@/lib/desktop'
-import type { KnowledgeOverview } from '@/lib/types'
+import {
+  approveLearnedAlias,
+  emailAnalysisFeedback,
+  loadKnowledgeOverview,
+  loadLearnedAliases,
+  rejectLearnedAlias,
+} from '@/lib/desktop'
+import type { KnowledgeOverview, LearnedAlias } from '@/lib/types'
 
 type KnowledgeSettingsProps = {
   initialOverview?: KnowledgeOverview
@@ -19,6 +32,11 @@ const categoryLabels: Record<string, string> = {
   summary: 'Összefoglaló',
   visualization: 'Megjelenítés',
   other: 'Egyéb',
+}
+
+const roleLabels: Record<LearnedAlias['role'], string> = {
+  end_customer: 'Végfelhasználó',
+  billed_customer: 'Számlázott vevő',
 }
 
 const errorText = (error: unknown): string => {
@@ -37,16 +55,40 @@ export const KnowledgeSettings = ({
   const [emailingId, setEmailingId] = useState<string | null>(null)
   const [sentIds, setSentIds] = useState<Set<string>>(() => new Set())
   const [error, setError] = useState<string | null>(null)
+  const [aliases, setAliases] = useState<LearnedAlias[]>([])
+  const [selectedCodes, setSelectedCodes] = useState<Record<string, string[]>>(
+    {},
+  )
+  const [aliasBusyId, setAliasBusyId] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
-      setOverview(await loadKnowledgeOverview())
+      const [loadedOverview, loadedAliases] = await Promise.all([
+        loadKnowledgeOverview(),
+        loadLearnedAliases(),
+      ])
+      setOverview(loadedOverview)
+      setAliases(loadedAliases)
     } catch (loadError) {
       setError(errorText(loadError))
     } finally {
       setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    void loadLearnedAliases()
+      .then((loaded) => {
+        if (active) setAliases(loaded)
+      })
+      .catch(() => {
+        // Az aliastár hiánya ne akadályozza a tudásállapot megjelenítését.
+      })
+    return () => {
+      active = false
     }
   }, [])
 
@@ -67,6 +109,50 @@ export const KnowledgeSettings = ({
       active = false
     }
   }, [initialOverview])
+
+  const toggleCode = (aliasId: string, code: string) => {
+    setSelectedCodes((current) => {
+      const selected = current[aliasId] ?? []
+      return {
+        ...current,
+        [aliasId]: selected.includes(code)
+          ? selected.filter((entry) => entry !== code)
+          : [...selected, code],
+      }
+    })
+  }
+
+  const approveAlias = async (aliasId: string) => {
+    const codes = selectedCodes[aliasId] ?? []
+    if (!codes.length) {
+      setError('Jelöld ki, melyik cég a helyes, mielőtt jóváhagyod.')
+      return
+    }
+    setAliasBusyId(aliasId)
+    setError(null)
+    try {
+      setAliases(await approveLearnedAlias(aliasId, codes))
+    } catch (approveError) {
+      setError(errorText(approveError))
+    } finally {
+      setAliasBusyId(null)
+    }
+  }
+
+  const rejectAlias = async (aliasId: string) => {
+    setAliasBusyId(aliasId)
+    setError(null)
+    try {
+      setAliases(await rejectLearnedAlias(aliasId))
+    } catch (rejectError) {
+      setError(errorText(rejectError))
+    } finally {
+      setAliasBusyId(null)
+    }
+  }
+
+  const pendingAliases = aliases.filter((alias) => alias.status === 'pending')
+  const approvedAliases = aliases.filter((alias) => alias.status === 'approved')
 
   const openEmail = async (feedbackId: string) => {
     setEmailingId(feedbackId)
@@ -169,11 +255,110 @@ export const KnowledgeSettings = ({
           )}
         </>
       ) : null}
+      <div className="knowledge-alias-block">
+        <strong className="knowledge-alias-title">
+          Jóváhagyásra váró cégazonosítás
+        </strong>
+        {pendingAliases.length ? (
+          <div className="knowledge-alias-list">
+            {pendingAliases.map((alias) => {
+              const selected = selectedCodes[alias.id] ?? []
+              return (
+                <article key={alias.id}>
+                  <div>
+                    <span className="knowledge-feedback-category">
+                      {roleLabels[alias.role]}
+                    </span>
+                    <time>
+                      {new Date(alias.createdAt).toLocaleDateString('hu-HU')}
+                    </time>
+                  </div>
+                  <strong>„{alias.searchName}” — melyik a helyes?</strong>
+                  <ul className="knowledge-alias-candidates">
+                    {alias.candidates.map((candidate) => (
+                      <li key={candidate.code}>
+                        <label>
+                          <input
+                            checked={selected.includes(candidate.code)}
+                            onChange={() =>
+                              toggleCode(alias.id, candidate.code)
+                            }
+                            type="checkbox"
+                          />
+                          <span>
+                            {candidate.label} <code>{candidate.code}</code>
+                          </span>
+                        </label>
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="knowledge-alias-actions">
+                    <button
+                      disabled={aliasBusyId === alias.id || !selected.length}
+                      onClick={() => void approveAlias(alias.id)}
+                      type="button"
+                    >
+                      {aliasBusyId === alias.id ? (
+                        <LoaderCircle
+                          aria-hidden="true"
+                          className="spin"
+                          size={13}
+                        />
+                      ) : (
+                        <Check aria-hidden="true" size={13} />
+                      )}
+                      Jóváhagyás
+                    </button>
+                    <button
+                      disabled={aliasBusyId === alias.id}
+                      onClick={() => void rejectAlias(alias.id)}
+                      type="button"
+                    >
+                      <X aria-hidden="true" size={13} />
+                      Elvetés
+                    </button>
+                  </div>
+                </article>
+              )
+            })}
+          </div>
+        ) : (
+          <p className="knowledge-empty">
+            Nincs jóváhagyásra váró cégazonosítás. Ha egy kérdésnél több cég is
+            illik a névre, az ERGO itt fogja felajánlani.
+          </p>
+        )}
+        {approvedAliases.length ? (
+          <div className="knowledge-alias-approved">
+            <span>Érvényben lévő azonosítások:</span>
+            <ul>
+              {approvedAliases.map((alias) => (
+                <li key={alias.id}>
+                  <span>
+                    „{alias.searchName}” → {alias.label} (
+                    {alias.codes.join(', ')}) · {roleLabels[alias.role]}
+                  </span>
+                  <button
+                    disabled={aliasBusyId === alias.id}
+                    onClick={() => void rejectAlias(alias.id)}
+                    type="button"
+                  >
+                    Visszavonás
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </div>
       {error ? <p className="settings-error">{error}</p> : null}
       <p className="knowledge-note">
         A visszajelzések helyben maradnak. Nem írják át automatikusan az SQL-t
         vagy az üzleti szabályokat; a fejlesztési csomag ellenőrzés után
-        kerülhet a következő tudásverzióba.
+        kerülhet a következő tudásverzióba. A helyesnek jelölt lekérdezéseket és
+        a javításaidat az ERGO hasonló kérdéseknél támpontként felhasználja. A
+        cégazonosítás viszont pénzügyi számokat érint, ezért csak az itt
+        jóváhagyott párosítás lép életbe.
       </p>
     </fieldset>
   )
